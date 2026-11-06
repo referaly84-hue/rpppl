@@ -8,7 +8,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getTeamLogo, getTeamColors, getCompetitionLogo } from './src/logos.ts';
-import { LEAGUE_REGULATIONS, getTeamZoneClass } from './src/rules.ts';
+import { LEAGUE_REGULATIONS, getTeamZoneClass, getRplLegionLimit, isLegionnaire, getLegionnaireStatus } from './src/rules.ts';
 import { getTeamCoach, computeCoachSynergy, type Coach } from './src/coaches.ts';
 import { computeMatchRatings, getMatchMotm, buildTeamOfRound, buildTeamOfMonth } from './src/awards.ts';
 import { initCup2026, recalculateCupGroups, drawNextRegionsRound } from './src/cup2026.ts';
@@ -967,14 +967,22 @@ const llmJSON = async (s: string, u: string, o?: any) => parseJSON(await llm(s, 
 
 /* ───────── карточки игроков ───────── */
 const CARD_SYS = `Ты — футбольный скаут-аналитик для симулятора. По имени игрока верни карточку в JSON. Используй только то, что знаешь достоверно; если игрока не знаешь — верни {"found":false}. Не выдумывай. Не пиши о личной жизни, здоровье, скандалах — только спорт.
-Формат одного игрока: {"found":true,"name":"Имя Фамилия по-русски","pos":"одна из: ${POSES.join(', ')}","born":"YYYY-MM-DD или YYYY","nation":"","realClub":"","style":"как играет, любимые действия на поле, 1–2 предложения","achievements":["главные достижения"],"stats2y":"реальная статистика за 2 последних сезона кратко","form":"последние результаты и тренд","character":"темперамент на поле: спокойный, вспыльчивый, лидер, легко провоцируется и т.п.","news":"спортивные новости за год кратко"}
+Формат одного игрока: {"found":true,"name":"Имя Фамилия по-русски","pos":"одна из: ${POSES.join(', ')}","born":"YYYY-MM-DD или YYYY","nation":"страна/гражданство (Россия, Белоруссия, Армения, Казахстан, Бразилия и т.д.)","playedForOtherNationalTeam":false,"otherNationalTeam":"если игрок заигран за национальную сборную другой страны (напр. Армения, Грузия, Сербия, Казахстан), указать точное название этой сборной, иначе пустая строка","realClub":"","style":"как играет, любимые действия на поле, 1–2 предложения","achievements":["главные достижения"],"stats2y":"реальная статистика за 2 последних сезона кратко","form":"последние результаты и тренд","character":"темперамент на поле: спокойный, вспыльчивый, лидер, легко провоцируется и т.п.","news":"спортивные новости за год кратко"}
 Для списка имён верни {"players":[...]} в том же порядке.`;
 
 function cardFrom(c: any, extra: any = {}) {
+  const hasOtherCap = !!(c.playedForOtherNationalTeam ||
+    (c.otherNationalTeam && norm(c.otherNationalTeam) !== 'россия') ||
+    (extra.otherNationalTeam && norm(extra.otherNationalTeam) !== 'россия') ||
+    extra.playedForOtherNationalTeam);
   return {
     id: uid(), teamId: extra.teamId || null, name: String(c.name || extra.name || '').trim(),
     pos: POSES.includes(c.pos) ? c.pos : (extra.pos || 'ЦП'),
-    born: c.born || '', nation: c.nation || '', realClub: c.realClub || '',
+    born: c.born || '',
+    nation: c.nation || extra.nation || 'Россия',
+    playedForOtherNationalTeam: hasOtherCap,
+    otherNationalTeam: c.otherNationalTeam || extra.otherNationalTeam || '',
+    realClub: c.realClub || '',
     style: c.style || '', achievements: Array.isArray(c.achievements) ? c.achievements : (c.achievements ? [c.achievements] : []),
     stats2y: c.stats2y || '', form: c.form || '', character: c.character || '', news: c.news || '',
     verified: !!c.__llm, updatedAt: new Date().toISOString(), out: null, banLeft: 0, seasonYC: 0
@@ -1081,24 +1089,49 @@ function fixLineup(L: any, tid: string, f: any) {
   const sq = squadOf(tid), ok = new Set(sq.filter((p: any) => isAvail(p, f.date)).map((p: any) => p.id));
   const F = parseFormation(L.formation); const used = new Set<string>();
   const starters: string[] = [];
+  const isRpl = f.comp === 'rpl';
+  const limit = isRpl ? getRplLegionLimit(S()) : null;
+  let legCount = 0;
+
   for (const id of L.starters || []) {
-    if (ok.has(id) && !used.has(id)) { starters.push(id); used.add(id); }
+    if (ok.has(id) && !used.has(id)) {
+      const p = player(id);
+      const isLeg = limit ? isLegionnaire(p) : false;
+      if (isLeg && legCount >= limit!.onPitch) {
+        continue; // skip excess legionnaire from starters to comply with limit
+      }
+      starters.push(id);
+      used.add(id);
+      if (isLeg) legCount++;
+    }
   }
   const hasGK = starters.some(id => player(id)?.pos === 'ВР');
   if (!hasGK) {
     const g = sq.find((p: any) => ok.has(p.id) && p.pos === 'ВР' && !used.has(p.id));
     if (g) {
-      if (starters.length >= 11) used.delete(starters.pop()!);
+      if (starters.length >= 11) {
+        const popped = starters.pop()!;
+        used.delete(popped);
+        if (limit && isLegionnaire(player(popped))) legCount--;
+      }
       starters.push(g.id); used.add(g.id);
+      if (limit && isLegionnaire(g)) legCount++;
     }
   }
   const avail = sq.filter((p: any) => ok.has(p.id));
   if (starters.length < 11) {
-    for (const id of autoPick(avail.filter((p: any) => !used.has(p.id)), { def: F.def, mid: F.mid, fwd: F.fwd }, used)) starters.push(id);
+    for (const id of autoPick(avail.filter((p: any) => !used.has(p.id) && (!limit || legCount < limit.onPitch || !isLegionnaire(p))), { def: F.def, mid: F.mid, fwd: F.fwd }, used)) {
+      starters.push(id);
+      if (limit && isLegionnaire(player(id))) legCount++;
+    }
   }
   for (const p of avail) {
     if (starters.length >= 11) break;
-    if (!used.has(p.id)) { starters.push(p.id); used.add(p.id); }
+    if (!used.has(p.id)) {
+      if (limit && legCount >= limit.onPitch && isLegionnaire(p)) continue;
+      starters.push(p.id); used.add(p.id);
+      if (limit && isLegionnaire(p)) legCount++;
+    }
   }
   const bench: string[] = [];
   for (const id of L.bench || []) {
@@ -2211,6 +2244,11 @@ const pubPlayer = (p: any) => ({
   name: p.name,
   pos: p.pos,
   born: p.born,
+  nation: p.nation || 'Россия',
+  playedForOtherNationalTeam: !!(p.playedForOtherNationalTeam || (p.otherNationalTeam && norm(p.otherNationalTeam) !== 'россия')),
+  otherNationalTeam: p.otherNationalTeam || '',
+  isLegionnaire: isLegionnaire(p),
+  legionStatus: getLegionnaireStatus(p),
   teamId: p.teamId,
   team: p.teamId ? tn(p.teamId) : 'без клуба',
   teamLogo: p.teamId ? teamLogo(p.teamId) : null,
@@ -2277,6 +2315,7 @@ app.post('/api/logout', (req, res) => {
 app.get('/api/state', (req: any, res) => {
   res.json({
     season: S(),
+    legionLimit: getRplLegionLimit(S()),
     comps: db.comps,
     teams: db.teams.map(pubTeam),
     me: req.me ? { role: req.me.role, teamId: req.me.teamId || null } : null,
@@ -2669,9 +2708,13 @@ app.get('/api/club', needClub, (req: any, res) => {
   const t = team(req.tid), sq = squadOf(req.tid);
   const today = new Date().toISOString().slice(0, 10);
   const up = seasonFx().filter((f: any) => (f.home === req.tid || f.away === req.tid) && f.status === 'scheduled').sort((a: any, b: any) => (a.date + a.time).localeCompare(b.date + b.time)).slice(0, 6);
+  const legionLimit = getRplLegionLimit(S());
+  const legionSquadCount = sq.filter(isLegionnaire).length;
   res.json({
     team: { ...pubTeam(t), code: req.me.role === 'admin' ? t.code : undefined },
     squadMax: db.settings.squadMax,
+    legionLimit,
+    legionSquadCount,
     squadSubmitted: !!db.squads[req.tid],
     squad: sq.map((p: any) => ({ ...pubPlayer(p), available: isAvail(p, today), card: p })),
     tactic: db.tactics[req.tid] || null,
@@ -2699,6 +2742,17 @@ app.post('/api/club/squad/add', needClub, async (req: any, res) => {
     const cur = squadOf(req.tid);
     if (cur.some((x: any) => x.id === p.id)) return res.json({ ok: 1 });
     if (cur.length >= db.settings.squadMax) return fail(res, `В заявке максимум ${db.settings.squadMax} игроков`);
+
+    // Лимит легионеров в заявке РПЛ (12+7 в 2026/27, 11+6 в 2027/28, 10+5 в 2028/29)
+    const tm = team(req.tid);
+    if (tm && tm.comp === 'rpl') {
+      const limit = getRplLegionLimit(S());
+      const curLegions = cur.filter(isLegionnaire);
+      if (isLegionnaire(p) && curLegions.length >= limit.inSquad) {
+        return fail(res, `Превышен лимит легионеров в заявке РПЛ: максимум ${limit.inSquad} по лимиту ${limit.label} на сезон ${S()} (сейчас в заявке: ${curLegions.length} легионеров)`);
+      }
+    }
+
     const owner = p.teamId && p.teamId !== req.tid && team(p.teamId) && (team(p.teamId).code || squadOf(p.teamId).length);
     if (owner && req.me.role !== 'admin') {
       db.transfers.push({ id: uid(), pid: p.id, from: p.teamId, to: req.tid, status: 'pending', note: String(req.body.note || '').slice(0, 300), at: Date.now() });
@@ -2740,6 +2794,16 @@ app.post('/api/club/lineup', needClub, (req: any, res) => {
   if (!st.some((id: string) => player(id)?.pos === 'ВР')) return fail(res, 'В старте нужен вратарь');
   const bad = st.map(player).filter((p: any) => !isAvail(p, f.date));
   if (bad.length) return fail(res, `Недоступны: ${bad.map((p: any) => p.name).join(', ')}`);
+
+  // Лимит на легионеров на поле в РПЛ (12+7 в 2026/27, 11+6 в 2027/28, 10+5 в 2028/29)
+  if (f.comp === 'rpl') {
+    const limit = getRplLegionLimit(S());
+    const legionStarters = st.map(player).filter(isLegionnaire);
+    if (legionStarters.length > limit.onPitch) {
+      return fail(res, `Превышен лимит легионеров на поле в РПЛ: в стартовом составе ${legionStarters.length} легионеров, разрешено максимум ${limit.onPitch} (лимит ${limit.label} на сезон ${S()})`);
+    }
+  }
+
   const fm = /^\d(-\d){1,3}$/.test(req.body.formation || '') ? req.body.formation : '4-3-3';
   const bench = (req.body.bench || []).filter((id: string) => sq.has(id) && !st.includes(id)).slice(0, 12);
   const L = {
@@ -2894,8 +2958,11 @@ app.post('/api/admin/player', admin, (req, res) => {
     p = cardFrom({ name: b.name }, { teamId: b.teamId });
     db.players.push(p);
   }
-  for (const k of ['name', 'pos', 'born', 'nation', 'realClub', 'style', 'stats2y', 'form', 'character', 'news']) {
+  for (const k of ['name', 'pos', 'born', 'nation', 'realClub', 'style', 'stats2y', 'form', 'character', 'news', 'otherNationalTeam']) {
     if (typeof b[k] === 'string') p[k] = b[k];
+  }
+  if (b.playedForOtherNationalTeam !== undefined) {
+    p.playedForOtherNationalTeam = !!b.playedForOtherNationalTeam;
   }
   if (b.achievements !== undefined) {
     p.achievements = Array.isArray(b.achievements) ? b.achievements : String(b.achievements).split('\n').map(s => s.trim()).filter(Boolean);

@@ -74,6 +74,9 @@ export const LEAGUE_REGULATIONS: Record<string, CompetitionRegulation> = {
     ],
     rulesSummary: [
       'Система: «осень-весна» (30 туров).',
+      'Лимит на легионеров: в сезоне 2026/27 действует лимит 12+7 (максимум 12 легионеров в заявке на сезон, не более 7 одновременно на поле). В сезоне 2027/28 — 11+6, в сезоне 2028/29 — 10+5.',
+      'Граждане стран ЕАЭС и Белоруссии под лимит не подпадают: Белоруссия, Казахстан, Армения, Киргизия.',
+      'Российский паспорт не спасает: если игрок с паспортом РФ уже сыграл за другую национальную сборную, по регламенту РПЛ он считается легионером.',
       'Напрямую вылетают команды с 15-го и 16-го мест.',
       '13-е место РПЛ играет стыки против 4-го места Первой лиги.',
       '14-е место РПЛ играет стыки против 3-го места Первой лиги.',
@@ -310,4 +313,88 @@ export function getTeamZoneClass(compId: string, pos: number, totalTeams: number
   }
 
   return { zoneClass: '' };
+}
+
+/* ───────── Лимит на легионеров в РПЛ (12+7 в 2026/27, 11+6 в 2027/28, 10+5 в 2028/29) ───────── */
+export const EAEU_COUNTRIES = new Set([
+  'белоруссия', 'беларусь', 'belarus',
+  'казахстан', 'kazakhstan',
+  'армения', 'armenia',
+  'киргизия', 'кыргызстан', 'kyrgyzstan'
+]);
+
+export interface RplLegionLimit {
+  inSquad: number;
+  onPitch: number;
+  label: string;
+}
+
+export function getRplLegionLimit(seasonStr?: string): RplLegionLimit {
+  const s = String(seasonStr || '2026/27');
+  if (s.includes('2028') || s === '2028/29') return { inSquad: 10, onPitch: 5, label: '10+5' };
+  if (s.includes('2027') || s === '2027/28') return { inSquad: 11, onPitch: 6, label: '11+6' };
+  return { inSquad: 12, onPitch: 7, label: '12+7' };
+}
+
+export function isLegionnaire(p: any): boolean {
+  if (!p) return false;
+  // Российский паспорт не спасает, если игрок уже сыграл за другую национальную сборную
+  const hasOtherCap = p.playedForOtherNationalTeam ||
+    (p.otherNationalTeam && String(p.otherNationalTeam).trim().toLowerCase() !== 'россия') ||
+    (p.nationalTeam && String(p.nationalTeam).trim().toLowerCase() !== 'россия');
+  if (hasOtherCap) return true;
+
+  const rawNat = String(p.nation || p.nationality || p.country || 'Россия').trim().toLowerCase();
+  if (rawNat === 'россия' || rawNat === 'рф' || rawNat === 'russia') return false;
+  if (EAEU_COUNTRIES.has(rawNat)) return false;
+  return true;
+}
+
+export function getLegionnaireStatus(p: any): {
+  isLegionnaire: boolean;
+  label: string;
+  tagClass: 'rus' | 'eaeu' | 'legion';
+  details: string;
+} {
+  if (!p) return { isLegionnaire: false, label: '—', tagClass: 'rus', details: '' };
+  const rawNat = String(p.nation || p.nationality || p.country || 'Россия').trim();
+  const natNorm = rawNat.toLowerCase();
+  const hasOtherCap = p.playedForOtherNationalTeam ||
+    (p.otherNationalTeam && String(p.otherNationalTeam).trim().toLowerCase() !== 'россия') ||
+    (p.nationalTeam && String(p.nationalTeam).trim().toLowerCase() !== 'россия');
+  const otherName = p.otherNationalTeam || p.nationalTeam || 'другая сборная';
+
+  if (hasOtherCap && (natNorm === 'россия' || natNorm === 'рф' || natNorm === 'russia')) {
+    return {
+      isLegionnaire: true,
+      label: 'Легионер (заигран)',
+      tagClass: 'legion',
+      details: `Паспорт РФ, но заигран за сборную ${otherName} — по регламенту РПЛ легионер`
+    };
+  }
+
+  if (natNorm === 'россия' || natNorm === 'рф' || natNorm === 'russia') {
+    return {
+      isLegionnaire: false,
+      label: 'РФ (не легионер)',
+      tagClass: 'rus',
+      details: 'Гражданин РФ, не заигран за другие сборные'
+    };
+  }
+
+  if (EAEU_COUNTRIES.has(natNorm)) {
+    return {
+      isLegionnaire: false,
+      label: `${rawNat} (ЕАЭС)`,
+      tagClass: 'eaeu',
+      details: 'Граждане стран ЕАЭС (Белоруссия, Казахстан, Армения, Киргизия) под лимит не подпадают'
+    };
+  }
+
+  return {
+    isLegionnaire: true,
+    label: `${rawNat} (Легионер)`,
+    tagClass: 'legion',
+    details: 'Иностранный гражданин — подпадает под лимит на легионеров в РПЛ'
+  };
 }

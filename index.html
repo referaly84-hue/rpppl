@@ -165,9 +165,33 @@ a.fxl{color:inherit}a.fxl:hover{background:var(--soft);text-decoration:none}
 .cal-chip.national{background:#ffe4e6;color:#9f1239;border-color:#fecdd3}
 .cal-chip.other{background:var(--soft);color:var(--ink);border-color:var(--line)}
 .cal-more{font-size:10px;color:var(--muted);font-weight:600;padding:1px 4px}
+
+.cal-tourn-pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:2px 7px;border-radius:12px;border:1px solid transparent;line-height:1.2;width:fit-content;max-width:100%;text-overflow:ellipsis;white-space:nowrap;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,0.03)}
+.cal-tourn-pill .cal-tourn-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.cal-tourn-pill.rpl{background:#e9f5ee;color:#065f46;border-color:#a7f3d0}
+.cal-tourn-pill.rpl .cal-tourn-dot{background:#059669}
+.cal-tourn-pill.cup{background:#fff7ed;color:#9a3412;border-color:#fed7aa}
+.cal-tourn-pill.cup .cal-tourn-dot{background:#ea580c}
+.cal-tourn-pill.media_cup{background:#faf5ff;color:#6b21a8;border-color:#e9d5ff}
+.cal-tourn-pill.media_cup .cal-tourn-dot{background:#9333ea}
+.cal-tourn-pill.fnl{background:#eff6ff;color:#1e40af;border-color:#bfdbfe}
+.cal-tourn-pill.fnl .cal-tourn-dot{background:#2563eb}
+.cal-tourn-pill.fnl2a{background:#f0f9ff;color:#0369a1;border-color:#bae6fd}
+.cal-tourn-pill.fnl2a .cal-tourn-dot{background:#0284c7}
+.cal-tourn-pill.fnl2b{background:#f0fdf4;color:#115e59;border-color:#99f6e4}
+.cal-tourn-pill.fnl2b .cal-tourn-dot{background:#0d9488}
+.cal-tourn-pill.media{background:#fffbeb;color:#b45309;border-color:#fde68a}
+.cal-tourn-pill.media .cal-tourn-dot{background:#d97706}
+.cal-tourn-pill.national{background:#fef2f2;color:#991b1b;border-color:#fecaca}
+.cal-tourn-pill.national .cal-tourn-dot{background:#dc2626}
+.cal-tourn-pill.other{background:#f1f5f9;color:#334155;border-color:#cbd5e1}
+.cal-tourn-pill.other .cal-tourn-dot{background:#64748b}
+.cal-tourn-badge-count{font-size:10px;padding:0 4px;border-radius:8px;background:rgba(0,0,0,0.08);font-weight:800}
+
 @media(max-width:768px){
   .cal-cell{min-height:74px;padding:3px}
   .cal-chip{font-size:9.5px;padding:2px 4px}
+  .cal-tourn-pill{font-size:9.5px;padding:1px 5px}
   .cal-weekday{font-size:10px;padding:4px 2px}
 }
 
@@ -1105,16 +1129,32 @@ async function pgFixtures(app, comp = 'rpl', round) {
       if (curBreak) periodBadge = `<span class="cal-period-badge break" title="${e(curBreak.name)}">🇷🇺 Сборные</span>`;
       else if (isWinter) periodBadge = `<span class="cal-period-badge winter" title="Зимний перерыв в РПЛ">❄️ Перерыв</span>`;
 
-      const visibleChips = mList.slice(0, 3).map(f => {
-        const cClass = f.comp === 'rpl' ? 'rpl' : (f.comp === 'cup' ? 'cup' : (f.comp === 'media_cup' ? 'media_cup' : (f.comp === 'fnl' ? 'fnl' : (f.comp === 'national' ? 'national' : 'other'))));
-        const scoreOrTime = f.status === 'done' ? `${f.hg}:${f.ag}` : (f.time || '19:00');
-        const shortMatch = f.isNational
-          ? `🇷🇺 ${f.homeName} — ${f.awayName}`
-          : `${f.homeName} ${scoreOrTime} ${f.awayName}`;
-        return `<a class="cal-chip ${cClass}" href="${f.isNational ? '#/national' : '#/match/' + f.id}" title="${e(f.label || '')}: ${e(f.homeName)} — ${e(f.awayName)}">${e(shortMatch)}</a>`;
-      }).join('');
+      const compCounts = {};
+      mList.forEach(f => {
+        const c = f.comp || 'other';
+        compCounts[c] = (compCounts[c] || 0) + 1;
+      });
 
-      const moreCount = mList.length > 3 ? `<div class="cal-more">+ ещё ${mList.length - 3}</div>` : '';
+      const compMeta = {
+        rpl: { label: 'РПЛ', cls: 'rpl', title: 'Мир Российская Премьер-Лига' },
+        cup: { label: 'FONBET Кубок', cls: 'cup', title: 'FONBET Кубок России' },
+        media_cup: { label: 'Кубок Лиги', cls: 'media_cup', title: 'Winline Кубок Лиги' },
+        fnl: { label: 'Первая лига', cls: 'fnl', title: 'МЕЛБЕТ-Первая Лига' },
+        '2la': { label: 'Вторая А', cls: 'fnl2a', title: 'Вторая лига «А»' },
+        '2lb': { label: 'Вторая Б', cls: 'fnl2b', title: 'Вторая лига «Б»' },
+        media: { label: 'Медиалига', cls: 'media', title: 'Winline Медиалига' },
+        national: { label: '🇷🇺 Сборная', cls: 'national', title: 'Товарищеский матч сборной' },
+        other: { label: 'Матч', cls: 'other', title: 'Матч' }
+      };
+
+      const tournamentBadges = Object.entries(compCounts).map(([cKey, count]) => {
+        const meta = compMeta[cKey] || { label: cKey.toUpperCase(), cls: 'other', title: cKey };
+        return `<div class="cal-tourn-pill ${meta.cls}" title="${meta.title}: ${count} ${count === 1 ? 'матч' : (count < 5 ? 'матча' : 'матчей')}">
+          <span class="cal-tourn-dot"></span>
+          <span class="cal-tourn-name">${meta.label}</span>
+          ${count > 1 ? `<span class="cal-tourn-badge-count">${count}</span>` : ''}
+        </div>`;
+      }).join('');
 
       cells.push(`
         <div class="${cellClasses}" data-cal-day="${dateStr}">
@@ -1122,9 +1162,8 @@ async function pgFixtures(app, comp = 'rpl', round) {
             <span>${d}</span>
             ${periodBadge}
           </div>
-          <div style="display:flex;flex-direction:column;gap:3px;margin-top:2px;overflow:hidden">
-            ${visibleChips}
-            ${moreCount}
+          <div style="display:flex;flex-direction:column;gap:3px;margin-top:4px;overflow:hidden">
+            ${tournamentBadges}
           </div>
         </div>
       `);
@@ -2208,9 +2247,43 @@ async function pgClub(app) {
 
   if (CT === 'squad') {
     const gp = { ВР: 0, ЦЗ: 1, ЛЗ: 1, ПЗ: 1, ОП: 2, ЦП: 2, АП: 2, ЛВ: 3, ПВ: 3, ЦФ: 3 };
-    cb.innerHTML = `<div class="panel"><h3>Добавить игрока</h3><p class="muted small">Начните вводить фамилию. Если игрока нет в базе, нажмите «Создать»: нейросеть заполнит карточку. Игрок из чужой заявки уйдёт на согласование админу.</p>
+    const isRpl = c.team.comp === 'rpl';
+    const limit = c.legionLimit || { inSquad: 12, onPitch: 7, label: '12+7' };
+    const curLegions = c.squad.filter(p => p.isLegionnaire).length;
+
+    const legionBanner = isRpl ? `
+      <div class="panel" style="background:${curLegions > limit.inSquad ? '#fef2f2' : '#f0fdf4'};border:1.5px solid ${curLegions > limit.inSquad ? '#f87171' : '#86efac'};margin-bottom:12px">
+        <div class="row sp" style="flex-wrap:wrap;gap:8px">
+          <div>
+            <b style="font-size:15px">Лимит на легионеров в РПЛ: ${limit.label}</b>
+            <span class="muted small" style="margin-left:8px">(в заявке до ${limit.inSquad}, на поле до ${limit.onPitch})</span>
+          </div>
+          <span class="tag" style="font-weight:700;background:${curLegions > limit.inSquad ? '#b91c1c' : '#15803d'};color:#fff">
+            Легионеров в заявке: ${curLegions} / ${limit.inSquad}
+          </span>
+        </div>
+        <div class="small muted" style="margin-top:6px;line-height:1.4">
+          ℹ️ Граждане стран <b>ЕАЭС и Белоруссии</b> (Белоруссия, Казахстан, Армения, Киргизия) под лимит не подпадают. Российский паспорт не спасает, если игрок уже сыграл за другую национальную сборную (он остаётся легионером).
+        </div>
+      </div>` : '';
+
+    cb.innerHTML = `
+    ${legionBanner}
+    <div class="panel"><h3>Добавить игрока</h3><p class="muted small">Начните вводить фамилию. Если игрока нет в базе, нажмите «Создать»: нейросеть заполнит карточку. Игрок из чужой заявки уйдёт на согласование админу.</p>
     <div class="row"><div class="sug" style="flex:1;min-width:240px"><input id="pn" placeholder="Например: Месси" autocomplete="off"><div class="list" id="pl" hidden></div></div><select id="pp" style="width:90px"><option value="">поз.</option>${Object.keys(gp).map(p => `<option>${p}</option>`).join('')}</select><button class="btn" id="padd">Создать и добавить</button></div></div>
-    <div class="panel wrap"><table><thead><tr><th class="l">Игрок</th><th>Поз.</th><th>Возраст</th><th class="l">Стиль</th><th class="l">Статус</th><th></th></tr></thead><tbody>${c.squad.sort((a, b) => gp[a.pos] - gp[b.pos]).map(p => `<tr><td class="l">${e(p.name)}</td><td>${p.pos}</td><td>${age(p.born)}</td><td class="l muted small" style="white-space:normal;max-width:340px">${e(p.style)}</td><td class="l">${p.available ? '<span class="tag">готов</span>' : `<span class="tag" style="background:#fde8e6">${p.banLeft > 0 ? 'дисквалификация' : 'травма'}</span>`}</td><td><button class="btn alt sm" data-rm="${p.id}">убрать</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">Заявка пуста.</td></tr>'}</tbody></table></div>
+    <div class="panel wrap"><table><thead><tr><th class="l">Игрок</th><th>Поз.</th><th>Возраст</th><th class="l">Гражданство / Статус</th><th class="l">Стиль</th><th class="l">Статус</th><th></th></tr></thead><tbody>${c.squad.sort((a, b) => gp[a.pos] - gp[b.pos]).map(p => {
+      const leg = p.legionStatus || { label: p.nation || 'Россия', tagClass: 'rus' };
+      const legTag = `<span class="tag" style="${leg.tagClass === 'legion' ? 'background:#fee2e2;color:#991b1b;border-color:#fca5a5' : (leg.tagClass === 'eaeu' ? 'background:#f0fdf4;color:#166534;border-color:#bbf7d0' : 'background:#eff6ff;color:#1e40af;border-color:#bfdbfe')}" title="${e(leg.details || '')}">${e(leg.label)}</span>`;
+      return `<tr>
+        <td class="l"><b>${e(p.name)}</b></td>
+        <td>${p.pos}</td>
+        <td>${age(p.born)}</td>
+        <td class="l">${legTag}</td>
+        <td class="l muted small" style="white-space:normal;max-width:320px">${e(p.style)}</td>
+        <td class="l">${p.available ? '<span class="tag">готов</span>' : `<span class="tag" style="background:#fde8e6">${p.banLeft > 0 ? 'дисквалификация' : 'травма'}</span>`}</td>
+        <td><button class="btn alt sm" data-rm="${p.id}">убрать</button></td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="7" class="empty">Заявка пуста.</td></tr>'}</tbody></table></div>
     <div class="row"><button class="btn" id="subm">Подать заявку на сезон</button><span class="muted small">${c.squadSubmitted ? 'Заявка подана. Изменения учитываются автоматически.' : 'Пока заявка не подана, в матчи идут все ваши игроки.'}</span></div>
     <div class="panel" style="margin-top:16px">
       <h3>Заявка на трансфер (иностранный игрок)</h3>
@@ -2310,18 +2383,61 @@ function lineupForm(box, f, c, withT, app) {
   const st = new Set(L.starters || []), bn = new Set(L.bench || []);
   const order = { ВР: 0, ЦЗ: 1, ЛЗ: 1, ПЗ: 1, ОП: 2, ЦП: 2, АП: 2, ЛВ: 3, ПВ: 3, ЦФ: 3 };
   const sq = [...c.squad].sort((a, b) => order[a.pos] - order[b.pos]);
+  const isRpl = c.team.comp === 'rpl' || f.comp === 'rpl';
+  const limit = c.legionLimit || { inSquad: 12, onPitch: 7, label: '12+7' };
 
   box.innerHTML = `<label>Схема</label><input class="fm" value="${e(L.formation || '4-3-3')}" style="max-width:140px">
   <label>Состав: выберите 11 в старт и до 9 на скамейку <span class="muted small" data-cnt></span></label>
-  <div>${sq.map(p => `<div class="pick ${p.available ? '' : 'off'}"><span class="tag">${p.pos}</span><span>${e(p.name)}${p.available ? '' : ' <span class="muted small">(недоступен)</span>'}</span><select data-p="${p.id}" ${p.available ? '' : 'disabled'}><option value="">—</option><option value="s" ${st.has(p.id) ? 'selected' : ''}>В старте</option><option value="b" ${bn.has(p.id) ? 'selected' : ''}>Скамейка</option></select></div>`).join('')}</div>
+  <div>${sq.map(p => {
+    const leg = p.legionStatus || { label: p.nation || 'Россия', tagClass: 'rus' };
+    const legPill = leg.tagClass === 'legion'
+      ? `<span class="tag" style="background:#fee2e2;color:#991b1b;border-color:#fca5a5;font-size:10px" title="${e(leg.details || '')}">⚡ Легионер</span>`
+      : (leg.tagClass === 'eaeu' ? `<span class="tag" style="background:#f0fdf4;color:#166534;border-color:#bbf7d0;font-size:10px" title="${e(leg.details || '')}">ЕАЭС</span>` : '');
+    return `<div class="pick ${p.available ? '' : 'off'}">
+      <span class="tag">${p.pos}</span>
+      <div style="flex:1;display:flex;align-items:center;gap:6px;overflow:hidden">
+        <span>${e(p.name)}</span>
+        ${legPill}
+        ${p.available ? '' : '<span class="muted small">(недоступен)</span>'}
+      </div>
+      <select data-p="${p.id}" ${p.available ? '' : 'disabled'}>
+        <option value="">—</option>
+        <option value="s" ${st.has(p.id) ? 'selected' : ''}>В старте</option>
+        <option value="b" ${bn.has(p.id) ? 'selected' : ''}>Скамейка</option>
+      </select>
+    </div>`;
+  }).join('')}</div>
   <label>Тактика — всё, что тренер говорит игрокам перед матчем</label><textarea class="sp1" placeholder="Пишите как есть: установка, настрой, речь. Молчание — тоже речь.">${e(L.speech || '')}</textarea>
   <label>Тренировочный план перед матчем (произвольный текст)</label><textarea class="tr1" placeholder="Например: пн — отдых, вт — прессинг 2 часа, ср — стандарты, чт — разминка, пт — отдых">${e(L.training || '')}</textarea>
   <div class="row" style="margin-top:14px"><button class="btn save">Сохранить</button><span class="muted small">Состав можно менять до начала матча.</span></div>`;
 
   const cnt = () => {
-    const a = [...box.querySelectorAll('select')].filter(s => s.value === 's').length;
-    const b = [...box.querySelectorAll('select')].filter(s => s.value === 'b').length;
-    box.querySelector('[data-cnt]').textContent = `— старт ${a}/11, скамейка ${b}`;
+    const sel = [...box.querySelectorAll('select')];
+    const sPids = sel.filter(s => s.value === 's').map(s => s.dataset.p);
+    const bPids = sel.filter(s => s.value === 'b').map(s => s.dataset.p);
+    const a = sPids.length;
+    const b = bPids.length;
+    const legOnPitch = sPids.filter(id => {
+      const p = c.squad.find(x => x.id === id);
+      return p?.isLegionnaire;
+    }).length;
+
+    let legionInfo = '';
+    if (isRpl) {
+      const isOver = legOnPitch > limit.onPitch;
+      legionInfo = ` · <span style="font-weight:700;color:${isOver ? '#dc2626' : '#15803d'}">⚡ Легионеров на поле: ${legOnPitch}/${limit.onPitch} (лимит ${limit.label})${isOver ? ' — ПРЕВЫШЕН ЛИМИТ!' : ''}</span>`;
+      const saveBtn = box.querySelector('.save');
+      if (saveBtn) {
+        if (isOver) {
+          saveBtn.disabled = true;
+          saveBtn.title = `Превышен лимит легионеров на поле (${legOnPitch} из ${limit.onPitch})`;
+        } else {
+          saveBtn.disabled = false;
+          saveBtn.title = '';
+        }
+      }
+    }
+    box.querySelector('[data-cnt]').innerHTML = `— старт ${a}/11, скамейка ${b}${legionInfo}`;
   };
   cnt();
   box.addEventListener('change', cnt);
@@ -2508,23 +2624,79 @@ async function pgAdmin(app) {
     ab.innerHTML = `<div class="panel"><div class="row"><input id="pq" placeholder="Поиск по фамилии" style="flex:1;min-width:200px"><select id="pt" style="max-width:230px"><option value="">Все команды</option>${T.map(t => `<option value="${t.id}">${e(t.name)}</option>`).join('')}</select><button class="btn" id="pnew">+ Игрок</button></div><div id="plist" class="wrap" style="margin-top:10px"></div></div>`;
     const load = async () => {
       const l = await api(`/admin/players?q=${encodeURIComponent($('#pq').value)}&teamId=${$('#pt').value}`);
-      $('#plist').innerHTML = `<table><thead><tr><th class="l">Имя</th><th>Поз.</th><th>Возр.</th><th class="l">Клуб</th><th class="l">Карточка</th><th></th></tr></thead><tbody>${l.map(p => `<tr>
-        <td class="l">${e(p.name)}</td>
-        <td>${p.pos}</td>
-        <td>${age(p.born)}</td>
-        <td class="l"><div class="t-cell">${p.teamLogo ? `<img class="t-logo" src="${p.teamLogo}" alt=""/>` : ''}<span>${e(p.team)}</span></div></td>
-        <td class="l">${p.verified ? '<span class="tag">нейросеть</span>' : '<span class="tag bg">вручную / пусто</span>'}</td>
-        <td><button class="btn alt sm" data-pe="${p.id}">Править</button></td>
-      </tr>`).join('') || '<tr><td colspan="6" class="empty">Никого нет</td></tr>'}</tbody></table>`;
+      $('#plist').innerHTML = `<table><thead><tr><th class="l">Имя</th><th>Поз.</th><th>Возр.</th><th class="l">Гражданство / Легионер</th><th class="l">Клуб</th><th class="l">Карточка</th><th></th></tr></thead><tbody>${l.map(p => {
+        const leg = p.legionStatus || { label: p.nation || 'Россия', tagClass: 'rus' };
+        const legBadge = `<span class="tag" style="${leg.tagClass === 'legion' ? 'background:#fee2e2;color:#991b1b;border-color:#fca5a5' : (leg.tagClass === 'eaeu' ? 'background:#f0fdf4;color:#166534;border-color:#bbf7d0' : 'background:#eff6ff;color:#1e40af;border-color:#bfdbfe')}" title="${e(leg.details || '')}">${e(leg.label)}</span>`;
+        return `<tr>
+          <td class="l"><b>${e(p.name)}</b></td>
+          <td>${p.pos}</td>
+          <td>${age(p.born)}</td>
+          <td class="l">${legBadge}</td>
+          <td class="l"><div class="t-cell">${p.teamLogo ? `<img class="t-logo" src="${p.teamLogo}" alt=""/>` : ''}<span>${e(p.team)}</span></div></td>
+          <td class="l">${p.verified ? '<span class="tag">нейросеть</span>' : '<span class="tag bg">вручную / пусто</span>'}</td>
+          <td><button class="btn alt sm" data-pe="${p.id}">Править</button></td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="7" class="empty">Никого нет</td></tr>'}</tbody></table>`;
       $('#plist').querySelectorAll('[data-pe]').forEach(b => b.onclick = () => pform(l.find(p => p.id === b.dataset.pe)));
     };
 
     const pform = p => {
       const f = (k, l, ta) => `<label>${l}</label>${ta ? `<textarea id="f_${k}" style="min-height:60px">${e(p?.[k] || '')}</textarea>` : `<input id="f_${k}" value="${e(p?.[k] || '')}">`}`;
-      modal(`<h3>${p ? e(p.name) : 'Новый игрок'}</h3>${f('name', 'Имя')}<div class="row"><div style="flex:1">${f('pos', 'Позиция (ВР, ЦЗ, ЛЗ, ПЗ, ОП, ЦП, АП, ЛВ, ПВ, ЦФ)')}</div><div style="flex:1">${f('born', 'Дата рождения (ГГГГ или ГГГГ-ММ-ДД)')}</div></div><label>Клуб</label><select id="f_teamId"><option value="">без клуба</option>${T.map(t => `<option value="${t.id}" ${p?.teamId === t.id ? 'selected' : ''}>${e(t.name)}</option>`).join('')}</select>${f('style', 'Стиль игры', 1)}<label>Достижения (по одному в строке)</label><textarea id="f_ach" style="min-height:60px">${e((p?.achievements || []).join('\n'))}</textarea>${f('stats2y', 'Статистика за 2 сезона', 1)}${f('form', 'Текущая форма', 1)}${f('character', 'Характер', 1)}${f('news', 'Новости', 1)}<div class="row" style="margin-top:14px"><button class="btn" id="psv">Сохранить</button>${p ? '<button class="btn red" id="pdl">Удалить</button>' : ''}</div>`, m => {
+      modal(`<h3>${p ? e(p.name) : 'Новый игрок'}</h3>
+        ${f('name', 'Имя')}
+        <div class="row">
+          <div style="flex:1">${f('pos', 'Позиция (ВР, ЦЗ, ЛЗ, ПЗ, ОП, ЦП, АП, ЛВ, ПВ, ЦФ)')}</div>
+          <div style="flex:1">${f('born', 'Дата рождения (ГГГГ или ГГГГ-ММ-ДД)')}</div>
+        </div>
+        <div class="row">
+          <div style="flex:1">${f('nation', 'Гражданство/Страна (Россия, Белоруссия, Армения, Казахстан, Бразилия и т.д.)')}</div>
+          <div style="flex:1">
+            <label>Клуб</label>
+            <select id="f_teamId"><option value="">без клуба</option>${T.map(t => `<option value="${t.id}" ${p?.teamId === t.id ? 'selected' : ''}>${e(t.name)}</option>`).join('')}</select>
+          </div>
+        </div>
+        <div class="panel" style="background:var(--soft);margin:8px 0;padding:10px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600">
+            <input type="checkbox" id="f_playedForOtherNationalTeam" ${p?.playedForOtherNationalTeam ? 'checked' : ''} style="width:auto">
+            <span>Заигран за другую национальную сборную</span>
+          </label>
+          <div class="small muted" style="margin-top:4px">
+            ⚠️ <b>Регламент РПЛ:</b> российский паспорт не спасает — если игрок сыграл за другую национальную сборную, он остаётся легионером.
+          </div>
+          <div style="margin-top:8px">
+            <label>Название другой сборной (если заигран):</label>
+            <input id="f_otherNationalTeam" value="${e(p?.otherNationalTeam || '')}" placeholder="Например: Армения, Грузия, Сербия, Казахстан">
+          </div>
+        </div>
+        ${f('style', 'Стиль игры', 1)}
+        <label>Достижения (по одному в строке)</label>
+        <textarea id="f_ach" style="min-height:60px">${e((p?.achievements || []).join('\n'))}</textarea>
+        ${f('stats2y', 'Статистика за 2 сезона', 1)}
+        ${f('form', 'Текущая форма', 1)}
+        ${f('character', 'Характер', 1)}
+        ${f('news', 'Новости', 1)}
+        <div class="row" style="margin-top:14px">
+          <button class="btn" id="psv">Сохранить</button>
+          ${p ? '<button class="btn red" id="pdl">Удалить</button>' : ''}
+        </div>`, m => {
         const g = k => m.querySelector('#f_' + k).value;
         m.querySelector('#psv').onclick = async () => {
-          const r = await act(() => api('/admin/player', { id: p?.id, name: g('name'), pos: g('pos'), born: g('born'), teamId: g('teamId'), style: g('style'), achievements: g('ach'), stats2y: g('stats2y'), form: g('form'), character: g('character'), news: g('news') }), 'Сохранено');
+          const r = await act(() => api('/admin/player', {
+            id: p?.id,
+            name: g('name'),
+            pos: g('pos'),
+            born: g('born'),
+            nation: g('nation') || 'Россия',
+            playedForOtherNationalTeam: m.querySelector('#f_playedForOtherNationalTeam')?.checked,
+            otherNationalTeam: g('otherNationalTeam'),
+            teamId: g('teamId'),
+            style: g('style'),
+            achievements: g('ach'),
+            stats2y: g('stats2y'),
+            form: g('form'),
+            character: g('character'),
+            news: g('news')
+          }), 'Сохранено');
           if (r) { m.remove(); load(); }
         };
         if (p) m.querySelector('#pdl').onclick = async () => {
