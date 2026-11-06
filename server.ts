@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getTeamLogo, getTeamColors, getCompetitionLogo } from './src/logos.ts';
 import { LEAGUE_REGULATIONS, getTeamZoneClass, getRplLegionLimit, isLegionnaire, getLegionnaireStatus } from './src/rules.ts';
-import { getTeamCoach, computeCoachSynergy, type Coach } from './src/coaches.ts';
+import { getTeamCoach, computeCoachSynergy, type Coach, STAFF_ROLES, type StaffRole, type StaffMember, generateClubStaff, getAllInitialStaff } from './src/coaches.ts';
 import { computeMatchRatings, getMatchMotm, buildTeamOfRound, buildTeamOfMonth } from './src/awards.ts';
 import { initCup2026, recalculateCupGroups, drawNextRegionsRound } from './src/cup2026.ts';
 
@@ -715,8 +715,18 @@ function load() {
     if (T(a) && T(b)) db.derbies.push({ id: uid(), a: T(a).id, b: T(b).id, name, note });
   }
 
-  // Инициализируем тренеров и актуальную структуру Кубка России 2026/2027
-  if (!db.coaches) db.coaches = {};
+  // Инициализируем тренеров и тренерский штаб клубов
+  if (!db.staff || !Array.isArray(db.staff) || db.staff.length < 50) {
+    db.staff = getAllInitialStaff(db.teams);
+  } else {
+    const existingTeamIds = new Set(db.staff.map((s: any) => s.teamId));
+    for (const t of db.teams) {
+      if (!existingTeamIds.has(t.id)) {
+        db.staff.push(...generateClubStaff(t));
+      }
+    }
+  }
+  if (!Array.isArray(db.coaches)) db.coaches = [];
   const hasModernSchedule = db.fixtures.some((f: any) => f.comp === 'cup' && f.cupPath === 'regions_qual' && f.date === '2026-07-21');
   if (!hasModernSchedule || !db.cupState2026) {
     genSeason('2026-07-18', S());
@@ -2216,16 +2226,41 @@ const fail = (res: Response, msg: string, code = 400) => res.status(code).json({
 function getCoachForTeam(tid: string): Coach {
   const t = team(tid);
   if (!t) return getTeamCoach('Неизвестный клуб', 'rpl');
-  if (db.coaches && db.coaches[tid]) {
+  if (db.staff && Array.isArray(db.staff)) {
+    const foundHead = db.staff.find((s: any) => s.teamId === tid && s.role === 'head');
+    if (foundHead) {
+      return {
+        id: foundHead.id,
+        name: foundHead.name,
+        clubName: t.name,
+        nationality: foundHead.nationality || 'Россия',
+        age: foundHead.age || 45,
+        style: (foundHead.style as any) || 'possession',
+        styleTitle: foundHead.styleTitle || 'Сбалансированный стиль',
+        styleDesc: foundHead.bio || '',
+        favoriteFormation: foundHead.favoriteFormation || '4-3-3',
+        reputation: (foundHead as any).reputation || 80,
+        temperament: (foundHead as any).temperament || 'Уравновешенный',
+        quote: (foundHead as any).quote || '«Дисциплина и командная игра — залог успеха»'
+      };
+    }
+  }
+  if (db.coaches && !Array.isArray(db.coaches) && db.coaches[tid]) {
     return { ...db.coaches[tid], clubName: t.name };
   }
   return getTeamCoach(t.name, t.comp);
+}
+
+function getStaffForTeam(tid: string): StaffMember[] {
+  if (!db.staff || !Array.isArray(db.staff)) return [];
+  return db.staff.filter((s: any) => s.teamId === tid);
 }
 
 const pubTeam = (t: any) => {
   const official = getTeamLogo(t.name, null, t.comp);
   const coach = getCoachForTeam(t.id);
   const synergy = computeCoachSynergy(coach, db.tactics[t.id]);
+  const staff = getStaffForTeam(t.id);
   return {
     id: t.id,
     name: t.name,
@@ -2235,7 +2270,8 @@ const pubTeam = (t: any) => {
     logo: official.startsWith('/assets/') ? official : (t.logo || official),
     colors: getTeamColors(t.name),
     coach,
-    synergy
+    synergy,
+    staff
   };
 };
 
@@ -3413,46 +3449,106 @@ app.get('/api/media_cup/structure', (req, res) => {
   });
 });
 
-/* ───────── главные тренеры (только админ) ───────── */
+/* ───────── главные тренеры и тренерский штаб (только админ) ───────── */
 app.get('/api/admin/coaches', admin, (req, res) => {
-  res.json({ coaches: db.coaches || [] });
+  res.json({
+    coaches: (db.staff || []).filter((s: any) => s.role === 'head'),
+    staff: db.staff || [],
+    roles: STAFF_ROLES
+  });
 });
 
 app.post('/api/admin/coach', admin, async (req, res) => {
-  const { name } = req.body;
-  if (!name) return fail(res, 'Укажите ФИО тренера');
-  if (!db.coaches) db.coaches = [];
-  let age = 45, nat = 'Россия', style = 'Сбалансированный', bio = '';
-  if (hasLLM()) {
+  const { name, role = 'head', teamId = '', age: reqAge, nationality: reqNat, specialty: reqSpec, favoriteFormation = '4-3-3', bio: reqBio, style: reqStyle } = req.body;
+  if (!name) return fail(res, 'Укажите ФИО специалиста');
+  if (!db.staff) db.staff = [];
+  const validRole: StaffRole = ['head', 'assistant', 'gk', 'fitness', 'attack', 'doctor'].includes(role) ? role : 'head';
+  const roleMeta = STAFF_ROLES[validRole] || STAFF_ROLES.head;
+
+  let age = Number(reqAge) || 45;
+  let nat = reqNat ? String(reqNat).trim() : 'Россия';
+  let specialty = reqSpec ? String(reqSpec).trim() : roleMeta.desc;
+  let bio = reqBio ? String(reqBio).trim() : '';
+
+  if (hasLLM() && !bio) {
     try {
-      const prompt = `Составь профиль футбольного главного тренера "${name}". Определи его возраст (число), гражданство (на русском), стиль игры/тактику (2-4 слова) и краткую биографию/опыт (2-3 предложения).
-Ответь строго в JSON: { "age": 46, "nat": "Россия", "style": "Атакующий прессинг", "bio": "..." }`;
-      const info = await llmJSON('Ты — футбольная энциклопедия.', prompt, { temp: 0.4, max: 500 });
-      if (info.age) age = Number(info.age) || 45;
+      const tm = team(teamId);
+      const prompt = `Составь профиль футбольного специалиста на должность "${roleMeta.title}" (${name})${tm ? ` в клуб "${tm.name}"` : ''}.
+Определи его примерный возраст (число), гражданство (на русском), узкую специализацию (1 предложение) и подробный опыт/биографию (2-3 предложения).
+Ответь строго в JSON: { "age": 46, "nat": "Россия", "specialty": "...", "bio": "..." }`;
+      const info = await llmJSON('Ты — футбольная спортивная энциклопедия.', prompt, { temp: 0.4, max: 500 });
+      if (info.age) age = Number(info.age) || age;
       if (info.nat) nat = String(info.nat);
-      if (info.style) style = String(info.style);
+      if (info.specialty) specialty = String(info.specialty);
       if (info.bio) bio = String(info.bio);
     } catch {}
   }
-  const coach = {
-    id: 'coach_' + uid(),
+
+  const tm = team(teamId);
+  const member: StaffMember = {
+    id: 'staff_' + uid(),
     name: String(name).trim(),
-    teamId: '',
+    role: validRole,
+    roleTitle: roleMeta.title,
+    teamId: teamId || '',
+    teamName: tm ? tm.name : '',
     age,
-    nat,
-    style,
-    bio: bio || `${name} — главный тренер (${style.toLowerCase()}).`
+    nationality: nat,
+    specialty,
+    favoriteFormation: validRole === 'head' ? (favoriteFormation || '4-3-3') : undefined,
+    style: validRole === 'head' ? (reqStyle || 'possession') : undefined,
+    styleTitle: validRole === 'head' ? 'Сбалансированный стиль' : undefined,
+    bio: bio || `${name} — ${roleMeta.title.toLowerCase()}${tm ? ` клуба «${tm.name}»` : ''}. ${specialty}.`
   };
-  db.coaches.push(coach);
+
+  db.staff.push(member);
   save();
-  res.json({ ok: 1, coach });
+  res.json({ ok: 1, coach: member, member });
 });
 
 app.post('/api/admin/coach/assign', admin, (req, res) => {
-  const { coachId, teamId } = req.body;
-  const c = (db.coaches || []).find((x: any) => x.id === coachId);
-  if (!c) return fail(res, 'Тренер не найден');
+  const { coachId, teamId, role } = req.body;
+  const c = (db.staff || []).find((x: any) => x.id === coachId);
+  if (!c) return fail(res, 'Специалист не найден');
   c.teamId = teamId || '';
+  const tm = team(teamId);
+  c.teamName = tm ? tm.name : '';
+  if (role && ['head', 'assistant', 'gk', 'fitness', 'attack', 'doctor'].includes(role)) {
+    c.role = role;
+    c.roleTitle = STAFF_ROLES[role as StaffRole]?.title || c.roleTitle;
+  }
+  save();
+  res.json({ ok: 1, coach: c, member: c });
+});
+
+app.post('/api/admin/coach/update', admin, (req, res) => {
+  const { id, name, role, teamId, age, nationality, specialty, favoriteFormation, bio } = req.body;
+  const c = (db.staff || []).find((x: any) => x.id === id);
+  if (!c) return fail(res, 'Специалист не найден');
+  if (name) c.name = String(name).trim();
+  if (role && ['head', 'assistant', 'gk', 'fitness', 'attack', 'doctor'].includes(role)) {
+    c.role = role;
+    c.roleTitle = STAFF_ROLES[role as StaffRole]?.title || c.roleTitle;
+  }
+  if (teamId !== undefined) {
+    c.teamId = teamId || '';
+    const tm = team(teamId);
+    c.teamName = tm ? tm.name : '';
+  }
+  if (age) c.age = Number(age) || c.age;
+  if (nationality) c.nationality = String(nationality).trim();
+  if (specialty) c.specialty = String(specialty).trim();
+  if (favoriteFormation && c.role === 'head') c.favoriteFormation = String(favoriteFormation).trim();
+  if (bio) c.bio = String(bio).trim();
+  save();
+  res.json({ ok: 1, coach: c, member: c });
+});
+
+app.post('/api/admin/coach/delete', admin, (req, res) => {
+  const { id } = req.body;
+  const idx = (db.staff || []).findIndex((x: any) => x.id === id);
+  if (idx < 0) return fail(res, 'Специалист не найден');
+  db.staff.splice(idx, 1);
   save();
   res.json({ ok: 1 });
 });

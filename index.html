@@ -281,6 +281,23 @@ a.fxl{color:inherit}a.fxl:hover{background:var(--soft);text-decoration:none}
 .synergy-bar-bg{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:6px}
 .synergy-bar-fill{height:100%;transition:width .3s}
 
+/* Staff Cards & Staff Grid */
+.staff-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px;margin-top:12px}
+.staff-card{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;gap:12px;align-items:flex-start;transition:transform .15s,box-shadow .15s}
+.staff-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.06)}
+.staff-avatar{width:42px;height:42px;border-radius:8px;background:var(--panel);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+.staff-role-badge{font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;display:inline-block;white-space:nowrap}
+.staff-role-badge.head{background:#e0f2fe;color:#0369a1;border:1px solid #bae6fd}
+.staff-role-badge.assistant{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}
+.staff-role-badge.gk{background:#fef3c7;color:#b45309;border:1px solid #fde68a}
+.staff-role-badge.fitness{background:#ffedd5;color:#c2410c;border:1px solid #fed7aa}
+.staff-role-badge.attack{background:#fae8ff;color:#86198f;border:1px solid #f5d0fe}
+.staff-role-badge.doctor{background:#fee2e2;color:#b91c1c;border:1px solid #fecaca}
+.filter-pills{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:12px;flex-wrap:wrap}
+.pill-btn{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:5px 12px;font-size:12.5px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;color:var(--muted);transition:all .15s}
+.pill-btn:hover{background:var(--soft);color:var(--ink)}
+.pill-btn.active{background:var(--deep);color:#fff;border-color:var(--deep)}
+
 /* Season Awards */
 .awards-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-bottom:16px}
 .award-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;display:flex;flex-direction:column;align-items:center;text-align:center;box-shadow:0 2px 6px rgba(0,0,0,0.03)}
@@ -2238,6 +2255,30 @@ async function pgClub(app) {
     </div>` : ''}
   </div>` : ''}
 
+  ${(c.team.staff && c.team.staff.filter(s => s.role !== 'head').length) ? `
+  <div class="panel" style="margin-bottom:16px">
+    <div class="row sp" style="margin-bottom:10px">
+      <h3 style="margin:0">Тренерский и медицинский штаб (${c.team.staff.filter(s => s.role !== 'head').length})</h3>
+      <span class="muted small">Ассистенты, тренеры вратарей, физподготовка, стандарты и врачи</span>
+    </div>
+    <div class="staff-grid">
+      ${c.team.staff.filter(s => s.role !== 'head').map(s => `
+        <div class="staff-card">
+          <div class="staff-avatar">${s.role === 'assistant' ? '📋' : s.role === 'gk' ? '🧤' : s.role === 'fitness' ? '⚡' : s.role === 'attack' ? '🎯' : s.role === 'doctor' ? '🩺' : '👔'}</div>
+          <div style="flex:1;min-width:0">
+            <div class="row" style="gap:6px;margin-bottom:4px">
+              <span class="staff-role-badge ${s.role}">${e(s.roleTitle || s.role)}</span>
+              <span class="muted small">${s.age ? s.age + ' лет' : ''}${s.nationality ? ' · ' + e(s.nationality) : ''}</span>
+            </div>
+            <div style="font-weight:700;font-size:14.5px;color:var(--ink)">${e(s.name)}</div>
+            ${s.specialty ? `<div class="small" style="color:var(--deep);margin-top:2px;font-weight:600">${e(s.specialty)}</div>` : ''}
+            ${s.bio ? `<div class="small muted" style="margin-top:4px;line-height:1.35">${e(s.bio)}</div>` : ''}
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  </div>` : ''}
+
   <div class="tabs"><button data-t="matches" class="${CT === 'matches' ? 'on' : ''}">Матчи и тактика</button><button data-t="squad" class="${CT === 'squad' ? 'on' : ''}">Заявка (${c.squad.length}/${c.squadMax})</button></div>
   <div id="cb"></div>`;
 
@@ -2460,7 +2501,7 @@ async function pgAdmin(app) {
   const tabs = [
     ['matches', 'Матчи'],
     ['referees', 'Судьи'],
-    ['coaches', 'Тренеры'],
+    ['coaches', 'Тренеры и штаб'],
     ['tournaments', 'Турниры'],
     ['clubs', 'Клубы и логотипы'],
     ['players', 'Игроки'],
@@ -2851,48 +2892,290 @@ async function pgAdmin(app) {
   }
   else if (AT === 'coaches') {
     const cData = await api('/admin/coaches');
-    const coaches = cData.coaches || [];
+    const allStaff = cData.staff || cData.coaches || [];
+    window._stfRole = window._stfRole || 'all';
+    window._stfClub = window._stfClub || 'all';
+    window._stfQuery = window._stfQuery || '';
+
+    const roleIcons = { head: '👔', assistant: '📋', gk: '🧤', fitness: '⚡', attack: '🎯', doctor: '🩺' };
+    const roleTitles = {
+      head: 'Главный тренер',
+      assistant: 'Ассистент тренера',
+      gk: 'Тренер вратарей',
+      fitness: 'Тренер по физподготовке',
+      attack: 'Тренер нападающих / аналитик',
+      doctor: 'Главный врач клуба'
+    };
+
+    const cntRole = r => allStaff.filter(s => s.role === r).length;
+    const q = (window._stfQuery || '').toLowerCase().trim();
+    const filteredStaff = allStaff.filter(s => {
+      if (window._stfRole !== 'all' && s.role !== window._stfRole) return false;
+      if (window._stfClub === 'free' && s.teamId) return false;
+      if (window._stfClub !== 'all' && window._stfClub !== 'free' && s.teamId !== window._stfClub) return false;
+      if (q) {
+        const text = `${s.name} ${s.specialty || ''} ${s.bio || ''} ${s.teamName || ''} ${s.nationality || ''}`.toLowerCase();
+        if (!text.includes(q)) return false;
+      }
+      return true;
+    });
+
     ab.innerHTML = `
       <div class="panel">
-        <h3>Добавить главного тренера</h3>
-        <p class="muted small">Введите только ФИО главного тренера — нейросеть сама составит его профиль (возраст, гражданство, стиль игры, биографию). После этого вы сможете назначить его любой команде.</p>
-        <div class="row" style="gap:8px;flex-wrap:wrap">
-          <input id="ch_name" placeholder="Полностью ФИО главного тренера" style="flex:2;min-width:220px">
-          <button class="btn" id="ch_add">Создать профиль (ИИ)</button>
+        <div class="row sp" style="flex-wrap:wrap;gap:10px;margin-bottom:12px">
+          <div>
+            <h3 style="margin:0">Тренеры и тренерский штаб клубов</h3>
+            <p class="muted small" style="margin:4px 0 0">Управление главными тренерами, ассистентами, тренерами вратарей, специалистами по физподготовке и врачами.</p>
+          </div>
+          <div class="row" style="gap:8px">
+            <span class="tag">Всего в базе: <b>${allStaff.length}</b></span>
+            <span class="tag" style="background:#e0f2fe;color:#0369a1">Главных: <b>${cntRole('head')}</b></span>
+            <span class="tag" style="background:#ecfdf5;color:#047857">Штаб: <b>${allStaff.length - cntRole('head') - cntRole('doctor')}</b></span>
+            <span class="tag" style="background:#fee2e2;color:#b91c1c">Врачи: <b>${cntRole('doctor')}</b></span>
+          </div>
+        </div>
+
+        <div class="filter-pills">
+          <button class="pill-btn ${window._stfRole === 'all' ? 'active' : ''}" data-stf-role="all">Все должности (${allStaff.length})</button>
+          <button class="pill-btn ${window._stfRole === 'head' ? 'active' : ''}" data-stf-role="head">👔 Главные тренеры (${cntRole('head')})</button>
+          <button class="pill-btn ${window._stfRole === 'assistant' ? 'active' : ''}" data-stf-role="assistant">📋 Ассистенты (${cntRole('assistant')})</button>
+          <button class="pill-btn ${window._stfRole === 'gk' ? 'active' : ''}" data-stf-role="gk">🧤 Тренеры вратарей (${cntRole('gk')})</button>
+          <button class="pill-btn ${window._stfRole === 'fitness' ? 'active' : ''}" data-stf-role="fitness">⚡ Физподготовка (${cntRole('fitness')})</button>
+          <button class="pill-btn ${window._stfRole === 'attack' ? 'active' : ''}" data-stf-role="attack">🎯 Атака / Аналитики (${cntRole('attack')})</button>
+          <button class="pill-btn ${window._stfRole === 'doctor' ? 'active' : ''}" data-stf-role="doctor">🩺 Врачи (${cntRole('doctor')})</button>
+        </div>
+
+        <div class="row" style="gap:10px;flex-wrap:wrap">
+          <div style="flex:2;min-width:240px">
+            <input id="stf_q" placeholder="🔍 Поиск по ФИО, клубу, специализации..." value="${e(window._stfQuery)}" style="width:100%">
+          </div>
+          <div style="flex:1;min-width:200px">
+            <select id="stf_club_filter" style="width:100%">
+              <option value="all">Все клубы (${T.length})</option>
+              <option value="free" ${window._stfClub === 'free' ? 'selected' : ''}>— Без клуба —</option>
+              ${T.map(t => `<option value="${t.id}" ${window._stfClub === t.id ? 'selected' : ''}>${e(t.name)} (${e(compName(t.comp))})</option>`).join('')}
+            </select>
+          </div>
         </div>
       </div>
+
+      <div class="panel">
+        <h4 style="margin:0 0 10px">➕ Добавить специалиста в штаб</h4>
+        <div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end">
+          <div style="flex:1.2;min-width:180px">
+            <label class="small muted">Должность в штабе</label>
+            <select id="stf_new_role" style="width:100%">
+              <option value="head">👔 Главный тренер</option>
+              <option value="assistant">📋 Ассистент / Старший тренер</option>
+              <option value="gk">🧤 Тренер вратарей</option>
+              <option value="fitness">⚡ Тренер по физподготовке</option>
+              <option value="attack">🎯 Тренер нападающих / аналитик</option>
+              <option value="doctor">🩺 Главный врач клуба</option>
+            </select>
+          </div>
+          <div style="flex:2;min-width:200px">
+            <label class="small muted">ФИО специалиста</label>
+            <input id="stf_new_name" placeholder="Напр. Валерий Карпин или Иван Карминати" style="width:100%">
+          </div>
+          <div style="flex:1.5;min-width:160px">
+            <label class="small muted">Клуб</label>
+            <select id="stf_new_team" style="width:100%">
+              <option value="">— Без клуба —</option>
+              ${T.map(t => `<option value="${t.id}">${e(t.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div style="flex:0.8;min-width:80px">
+            <label class="small muted">Возраст</label>
+            <input id="stf_new_age" type="number" value="45" min="25" max="80" style="width:100%">
+          </div>
+          <div style="flex:1;min-width:110px">
+            <label class="small muted">Гражданство</label>
+            <input id="stf_new_nat" value="Россия" style="width:100%">
+          </div>
+          <div class="row" style="gap:6px;margin-top:4px">
+            <button class="btn" id="stf_btn_ai" title="Нейросеть сама найдёт информацию и составит подробный рассказ/профиль">Создать профиль (ИИ)</button>
+            <button class="btn alt" id="stf_btn_man">Добавить</button>
+          </div>
+        </div>
+      </div>
+
       <div class="panel wrap">
-        <h3>Главные тренеры</h3>
+        <div class="row sp" style="margin-bottom:12px">
+          <h3 style="margin:0">Список специалистов (${filteredStaff.length})</h3>
+          ${(window._stfRole !== 'all' || window._stfClub !== 'all' || window._stfQuery) ? `<button class="btn sm alt" id="stf_reset">Сбросить фильтры</button>` : ''}
+        </div>
         <table>
-          <thead><tr><th class="l">Тренер</th><th>Возраст</th><th class="l">Гражданство</th><th class="l">Стиль</th><th class="l">Команда</th></tr></thead>
+          <thead>
+            <tr>
+              <th class="l" style="width:140px">Должность</th>
+              <th class="l">Специалист и профиль</th>
+              <th>Возраст</th>
+              <th class="l">Гражданство</th>
+              <th class="l" style="width:230px">Клуб</th>
+              <th style="width:110px">Действия</th>
+            </tr>
+          </thead>
           <tbody>
-            ${coaches.length ? coaches.map(c => `<tr>
-              <td class="l"><b>${e(c.name)}</b><div class="muted small" style="white-space:normal;max-width:280px">${e(c.bio || '')}</div></td>
-              <td>${c.age || 45}</td>
-              <td class="l">${e(c.nat || 'Россия')}</td>
-              <td class="l"><span class="tag">${e(c.style || '—')}</span></td>
+            ${filteredStaff.length ? filteredStaff.map(c => `<tr>
+              <td class="l">
+                <span class="staff-role-badge ${c.role || 'head'}">
+                  ${roleIcons[c.role] || '👔'} ${e(c.roleTitle || roleTitles[c.role] || 'Тренер')}
+                </span>
+                ${c.role === 'head' && c.favoriteFormation ? `<div class="small muted" style="margin-top:4px">Схема: <b>${e(c.favoriteFormation)}</b></div>` : ''}
+              </td>
+              <td class="l">
+                <div style="font-weight:700;font-size:14.5px;color:var(--ink)">${e(c.name)}</div>
+                ${c.specialty ? `<div class="small" style="color:var(--deep);font-weight:600;margin-top:2px">${e(c.specialty)}</div>` : ''}
+                ${c.bio ? `<div class="muted small" style="white-space:normal;max-width:340px;line-height:1.35;margin-top:3px">${e(c.bio)}</div>` : ''}
+              </td>
+              <td><b>${c.age || 45}</b></td>
+              <td class="l">${e(c.nationality || c.nat || 'Россия')}</td>
               <td class="l">
                 <div class="row" style="gap:6px">
-                  <select class="ch_tm" data-cid="${c.id}" style="max-width:190px">
+                  <select class="ch_tm" data-cid="${c.id}" style="max-width:160px;font-size:12px">
                     <option value="">— Без клуба —</option>
                     ${T.map(t => `<option value="${t.id}" ${c.teamId === t.id ? 'selected' : ''}>${e(t.name)}</option>`).join('')}
                   </select>
-                  <button class="btn sm" data-ch-save="${c.id}">Назначить</button>
+                  <button class="btn sm" data-ch-save="${c.id}" title="Сохранить назначение клуба">✓</button>
                 </div>
               </td>
-            </tr>`).join('') : '<tr><td colspan="5" class="empty">Тренеров пока нет.</td></tr>'}
+              <td>
+                <div class="row" style="gap:6px;justify-content:center">
+                  <button class="btn sm alt" data-stf-edit="${c.id}" title="Редактировать специалиста">✏️</button>
+                  <button class="btn sm warn" data-stf-del="${c.id}" title="Удалить из штаба">✕</button>
+                </div>
+              </td>
+            </tr>`).join('') : '<tr><td colspan="6" class="empty">По заданным фильтрам специалисты не найдены.</td></tr>'}
           </tbody>
         </table>
       </div>`;
-    $('#ch_add').onclick = async () => {
-      const r = await act(() => api('/admin/coach', { name: $('#ch_name').value }), 'Профиль тренера создан');
+
+    // Обработчики фильтров
+    ab.querySelectorAll('[data-stf-role]').forEach(b => b.onclick = () => {
+      window._stfRole = b.dataset.stfRole;
+      re();
+    });
+    $('#stf_club_filter').onchange = (ev) => {
+      window._stfClub = ev.target.value;
+      re();
+    };
+    $('#stf_q').oninput = (ev) => {
+      window._stfQuery = ev.target.value;
+    };
+    $('#stf_q').onkeydown = (ev) => {
+      if (ev.key === 'Enter') re();
+    };
+    $('#stf_reset') && ($('#stf_reset').onclick = () => {
+      window._stfRole = 'all';
+      window._stfClub = 'all';
+      window._stfQuery = '';
+      re();
+    });
+
+    // Добавление специалиста (ИИ)
+    $('#stf_btn_ai').onclick = async () => {
+      const name = $('#stf_new_name').value.trim();
+      if (!name) return toast('Укажите ФИО специалиста', true);
+      const role = $('#stf_new_role').value;
+      const teamId = $('#stf_new_team').value;
+      const age = Number($('#stf_new_age').value) || 45;
+      const nationality = $('#stf_new_nat').value.trim() || 'Россия';
+      const r = await act(() => api('/admin/coach', { name, role, teamId, age, nationality }), 'Профиль сформирован нейросетью');
       if (r) re();
     };
+
+    // Добавление специалиста (Вручную)
+    $('#stf_btn_man').onclick = async () => {
+      const name = $('#stf_new_name').value.trim();
+      if (!name) return toast('Укажите ФИО специалиста', true);
+      const role = $('#stf_new_role').value;
+      const teamId = $('#stf_new_team').value;
+      const age = Number($('#stf_new_age').value) || 45;
+      const nationality = $('#stf_new_nat').value.trim() || 'Россия';
+      const r = await act(() => api('/admin/coach', { name, role, teamId, age, nationality, bio: `${name} — ${roleTitles[role] || 'специалист штаба'}.` }), 'Специалист добавлен');
+      if (r) re();
+    };
+
+    // Быстрое назначение клуба
     ab.querySelectorAll('[data-ch-save]').forEach(b => b.onclick = async () => {
       const cid = b.dataset.chSave;
       const sel = ab.querySelector(`.ch_tm[data-cid="${cid}"]`);
-      await act(() => api('/admin/coach/assign', { coachId: cid, teamId: sel?.value || '' }), 'Команда назначена');
+      await act(() => api('/admin/coach/assign', { coachId: cid, teamId: sel?.value || '' }), 'Клуб обновлён');
       re();
+    });
+
+    // Редактирование специалиста
+    ab.querySelectorAll('[data-stf-edit]').forEach(b => b.onclick = () => {
+      const s = allStaff.find(x => x.id === b.dataset.stfEdit);
+      if (!s) return;
+      const m = modal(`
+        <h3>Редактировать специалиста</h3>
+        <label>Должность в штабе</label>
+        <select id="ed_stf_role" style="width:100%;margin-bottom:8px">
+          <option value="head" ${s.role === 'head' ? 'selected' : ''}>👔 Главный тренер</option>
+          <option value="assistant" ${s.role === 'assistant' ? 'selected' : ''}>📋 Ассистент / Старший тренер</option>
+          <option value="gk" ${s.role === 'gk' ? 'selected' : ''}>🧤 Тренер вратарей</option>
+          <option value="fitness" ${s.role === 'fitness' ? 'selected' : ''}>⚡ Тренер по физподготовке</option>
+          <option value="attack" ${s.role === 'attack' ? 'selected' : ''}>🎯 Тренер нападающих / аналитик</option>
+          <option value="doctor" ${s.role === 'doctor' ? 'selected' : ''}>🩺 Главный врач клуба</option>
+        </select>
+        <label>ФИО</label>
+        <input id="ed_stf_name" value="${e(s.name)}" style="width:100%;margin-bottom:8px">
+        <div class="row" style="gap:8px;margin-bottom:8px">
+          <div style="flex:1">
+            <label>Клуб</label>
+            <select id="ed_stf_team" style="width:100%">
+              <option value="">— Без клуба —</option>
+              ${T.map(t => `<option value="${t.id}" ${s.teamId === t.id ? 'selected' : ''}>${e(t.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div style="flex:0.6">
+            <label>Возраст</label>
+            <input id="ed_stf_age" type="number" value="${s.age || 45}" style="width:100%">
+          </div>
+          <div style="flex:1">
+            <label>Гражданство</label>
+            <input id="ed_stf_nat" value="${e(s.nationality || s.nat || 'Россия')}" style="width:100%">
+          </div>
+        </div>
+        ${s.role === 'head' ? `
+        <label>Любимая тактическая схема</label>
+        <input id="ed_stf_fm" value="${e(s.favoriteFormation || '4-3-3')}" style="width:100%;margin-bottom:8px">` : ''}
+        <label>Специализация в штабе</label>
+        <input id="ed_stf_spec" value="${e(s.specialty || '')}" placeholder="Напр. Подготовка вратарей к пенальти" style="width:100%;margin-bottom:8px">
+        <label>Биография и опыт работы</label>
+        <textarea id="ed_stf_bio" style="width:100%;min-height:90px">${e(s.bio || '')}</textarea>
+        <div class="row" style="margin-top:14px;gap:8px">
+          <button class="btn" id="ed_stf_save">Сохранить изменения</button>
+          <button class="btn alt" id="ed_stf_cancel">Отмена</button>
+        </div>
+      `, m => {
+        m.querySelector('#ed_stf_cancel').onclick = () => m.remove();
+        m.querySelector('#ed_stf_save').onclick = async () => {
+          const name = m.querySelector('#ed_stf_name').value.trim();
+          if (!name) return toast('Укажите ФИО', true);
+          const role = m.querySelector('#ed_stf_role').value;
+          const teamId = m.querySelector('#ed_stf_team').value;
+          const age = Number(m.querySelector('#ed_stf_age').value) || s.age;
+          const nationality = m.querySelector('#ed_stf_nat').value.trim();
+          const favoriteFormation = m.querySelector('#ed_stf_fm')?.value.trim();
+          const specialty = m.querySelector('#ed_stf_spec').value.trim();
+          const bio = m.querySelector('#ed_stf_bio').value.trim();
+          const res = await act(() => api('/admin/coach/update', { id: s.id, name, role, teamId, age, nationality, favoriteFormation, specialty, bio }), 'Профиль сохранён');
+          if (res) {
+            m.remove();
+            re();
+          }
+        };
+      });
+    });
+
+    // Удаление специалиста
+    ab.querySelectorAll('[data-stf-del]').forEach(b => b.onclick = async () => {
+      const s = allStaff.find(x => x.id === b.dataset.stfDel);
+      if (!s) return;
+      const res = await act(() => api('/admin/coach/delete', { id: s.id }), 'Специалист удалён');
+      if (res) re();
     });
   }
   else if (AT === 'tournaments') {
