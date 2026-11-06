@@ -1503,10 +1503,6 @@ async function pgLeaders(app) {
   <div class="comp-banner" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
     <div style="display:flex;align-items:center;gap:16px;">
       <img src="${logoUrl}" alt="${e(currentCompObj?.name || 'Статистика')}" class="comp-banner-logo" onerror="this.style.display='none'"/>
-      <div>
-        <h1 class="comp-banner-title">Статистика и награды · ${e(currentCompObj?.name || 'РПЛ')}</h1>
-        <div class="comp-banner-sub">Сезон ${e(S.st?.season || '2026/27')} · Лидеры, сборные туров, символические сборные и призы сезона</div>
-      </div>
     </div>
   </div>
   <div style="margin-bottom:16px;position:relative;display:inline-block" id="ld_comp_dd">
@@ -1544,14 +1540,7 @@ async function pgLeaders(app) {
           + renderGroup('Медиалига', media);
       })()}
     </div>
-  </div>
-  <div class="tabs" style="border-bottom:2px solid var(--line);margin-bottom:16px">
-    <button data-ltab="ind" class="${LD.tab === 'ind' ? 'on' : ''}">📊 Индивидуальная статистика</button>
-    <button data-ltab="round" class="${LD.tab === 'round' ? 'on' : ''}">🌟 Сборная тура (4-3-3)</button>
-    <button data-ltab="month" class="${LD.tab === 'month' ? 'on' : ''}">📅 Сборная месяца</button>
-    <button data-ltab="season" class="${LD.tab === 'season' ? 'on' : ''}">🏆 Итоги сезона</button>
-  </div>
-  ${tabContent}`;
+  </div>`;
 
   const ddBtn = app.querySelector('#ld_comp_btn');
   const ddMenu = app.querySelector('#ld_comp_menu');
@@ -2542,6 +2531,13 @@ async function pgAdmin(app) {
           <select id="dt_to" style="flex:1;min-width:180px">
             ${T.map(t => `<option value="${t.id}">${e(t.name)}</option>`).join('')}
           </select>
+          <select id="dt_type" style="width:auto;min-width:170px">
+            <option value="direct">Прямой трансфер</option>
+            <option value="loan_0.5">Аренда (0.5 года)</option>
+            <option value="loan_1">Аренда (1 год)</option>
+            <option value="loan_1.5">Аренда (1.5 года)</option>
+            <option value="loan_2">Аренда (2 года)</option>
+          </select>
           <button class="btn" id="dt_go">Перевести игрока</button>
         </div>
       </div>
@@ -2577,7 +2573,8 @@ async function pgAdmin(app) {
       re();
     });
     $('#dt_go').onclick = async () => {
-      const r = await act(() => api('/admin/transfer/direct', { pid: $('#dt_pid').value, toTeamId: $('#dt_to').value }), 'Игрок переведён, статистика сохранена');
+      const transferType = $('#dt_type').value;
+      const r = await act(() => api('/admin/transfer/direct', { pid: $('#dt_pid').value, toTeamId: $('#dt_to').value, transferType }), 'Переход оформлен, статистика сохранена');
       if (r) re();
     };
     $('#cs_go').onclick = async () => {

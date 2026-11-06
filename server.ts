@@ -3475,7 +3475,7 @@ app.delete('/api/admin/tournament/:id', admin, (req, res) => {
 
 /* ───────── прямой трансфер админа (с сохранением всей статистики) ───────── */
 app.post('/api/admin/transfer/direct', admin, (req, res) => {
-  const { pid, toTeamId } = req.body;
+  const { pid, toTeamId, transferType } = req.body;
   const p = player(pid);
   const toTeam = team(toTeamId);
   if (!p || !toTeam) return fail(res, 'Игрок или клуб не найден');
@@ -3485,6 +3485,20 @@ app.post('/api/admin/transfer/direct', admin, (req, res) => {
   }
   db.squads[toTeamId] = [...new Set([...squadOf(toTeamId).map((x: any) => x.id), p.id])];
   p.teamId = toTeamId;
+  const loanMap: Record<string, string> = {
+    'loan_0.5': 'Аренда (0.5 года)',
+    'loan_1': 'Аренда (1 год)',
+    'loan_1.5': 'Аренда (1.5 года)',
+    'loan_2': 'Аренда (2 года)'
+  };
+  const note = loanMap[transferType] || 'Прямой трансфер';
+  if (loanMap[transferType]) {
+    p.loanFrom = fromTeamId;
+    p.loanTerm = loanMap[transferType];
+  } else {
+    delete p.loanFrom;
+    delete p.loanTerm;
+  }
   // Вся статистика игрока (goals, assists, matches, yellowCards, redCards, saves, tackles, shots, xg, cleanSheets, rating, seasonYC, banLeft) сохраняется!
   db.transfers.unshift({
     id: uid(),
@@ -3492,6 +3506,7 @@ app.post('/api/admin/transfer/direct', admin, (req, res) => {
     playerName: p.name,
     from: fromTeamId,
     to: toTeamId,
+    note,
     status: 'approved',
     date: new Date().toISOString().slice(0, 10),
     byAdmin: true
