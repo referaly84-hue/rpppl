@@ -1509,11 +1509,35 @@ async function pgLeaders(app) {
       </div>
     </div>
   </div>
-  <div class="row" style="margin-bottom:14px;align-items:center">
-    <label for="ld_comp_select" class="muted small" style="margin:0;font-weight:600">Турнир:</label>
-    <select id="ld_comp_select" style="width:auto;min-width:260px;padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel);font-weight:600">
-      ${(S.st?.comps || []).filter(c => c.type === 'league' || c.id === 'cup' || c.id === 'media_cup').map(c => `<option value="${c.id}" ${c.id === LD.comp ? 'selected' : ''}>${e(c.name)}</option>`).join('')}
-    </select>
+  <div style="margin-bottom:16px;position:relative;display:inline-block" id="ld_comp_dd">
+    <button type="button" id="ld_comp_btn" style="display:inline-flex;align-items:center;gap:10px;background:var(--panel);border:1.5px solid var(--line);border-radius:10px;padding:8px 14px;box-shadow:0 2px 8px rgba(16,38,28,.06);cursor:pointer;font-weight:700;font-size:15px;color:var(--ink);min-width:290px;justify-content:space-between">
+      <span style="display:inline-flex;align-items:center;gap:10px">
+        <img src="${logoUrl}" alt="" style="width:22px;height:22px;object-fit:contain" onerror="this.style.display='none'"/>
+        <span>${e(currentCompObj?.name || 'Выберите турнир')}</span>
+      </span>
+      <span class="muted" style="font-size:12px">▾</span>
+    </button>
+    <div id="ld_comp_menu" style="display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:50;background:var(--panel);border:1.5px solid var(--line);border-radius:12px;box-shadow:0 10px 28px rgba(16,38,28,.14);min-width:330px;max-height:380px;overflow-y:auto;padding:6px">
+      ${(() => {
+        const allC = (S.st?.comps || []).filter(c => c.type === 'league' || c.id === 'cup' || c.id === 'media_cup');
+        const leagues = allC.filter(c => c.type === 'league' && !c.id.startsWith('media')).sort((a, b) => (a.tier || 99) - (b.tier || 99));
+        const cupsAndMedia = allC.filter(c => c.type === 'cup' || c.id.startsWith('media'));
+        const renderGroup = (gTitle, list) => !list.length ? '' : `
+          <div style="padding:4px 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">${gTitle}</div>
+          ${list.map(c => {
+            const act = c.id === LD.comp;
+            return `<button type="button" data-dd-comp="${c.id}" style="width:100%;display:flex;align-items:center;gap:10px;padding:8px 10px;border:none;border-radius:8px;background:${act ? 'var(--soft)' : 'transparent'};cursor:pointer;text-align:left;color:var(--ink)">
+              <img src="${compLogo(c.id)}" alt="" style="width:22px;height:22px;object-fit:contain;flex-shrink:0" onerror="this.style.display='none'"/>
+              <div style="flex:1;min-width:0">
+                <div style="font-weight:${act ? '700' : '600'};font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${e(c.name)}</div>
+                ${c.level ? `<div class="small muted" style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${e(c.level)}</div>` : ''}
+              </div>
+              ${act ? '<span style="color:var(--green);font-weight:700">✓</span>' : ''}
+            </button>`;
+          }).join('')}`;
+        return renderGroup('Чемпионаты', leagues) + renderGroup('Кубки и Медиалига', cupsAndMedia);
+      })()}
+    </div>
   </div>
   <div class="tabs" style="border-bottom:2px solid var(--line);margin-bottom:16px">
     <button data-ltab="ind" class="${LD.tab === 'ind' ? 'on' : ''}">📊 Индивидуальная статистика</button>
@@ -1523,8 +1547,19 @@ async function pgLeaders(app) {
   </div>
   ${tabContent}`;
 
-  const ldSel = app.querySelector('#ld_comp_select');
-  if (ldSel) ldSel.onchange = () => { LD.comp = ldSel.value; pgLeaders(app); };
+  const ddBtn = app.querySelector('#ld_comp_btn');
+  const ddMenu = app.querySelector('#ld_comp_menu');
+  if (ddBtn && ddMenu) {
+    ddBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      ddMenu.style.display = ddMenu.style.display === 'none' ? 'block' : 'none';
+    };
+    ddMenu.querySelectorAll('[data-dd-comp]').forEach(b => b.onclick = () => {
+      LD.comp = b.dataset.ddComp;
+      pgLeaders(app);
+    });
+    document.addEventListener('click', () => { if (ddMenu) ddMenu.style.display = 'none'; }, { once: true });
+  }
   app.querySelectorAll('[data-ltab]').forEach(b => b.onclick = () => { LD.tab = b.dataset.ltab; pgLeaders(app); });
   app.querySelectorAll('[data-sel-round]').forEach(b => b.onclick = () => { LD.round = b.dataset.selRound; pgLeaders(app); });
   app.querySelectorAll('[data-sel-month]').forEach(b => b.onclick = () => { LD.month = b.dataset.selMonth; pgLeaders(app); });
