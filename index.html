@@ -268,18 +268,10 @@ a.fxl{color:inherit}a.fxl:hover{background:var(--soft);text-decoration:none}
 .cup-group-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.03)}
 .cup-stage-badge{display:inline-block;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:6px;background:var(--soft);color:var(--deep);margin-bottom:8px}
 
-/* Coach Card & Tactical Synergy */
+/* Coach Card */
 .coach-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
 .coach-header{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .coach-avatar{width:56px;height:56px;border-radius:50%;background:var(--soft);border:2px solid var(--green);display:flex;align-items:center;justify-content:center;font:700 20px Unbounded;color:var(--deep);flex-shrink:0}
-.synergy-badge{font-size:12px;font-weight:700;padding:3px 9px;border-radius:6px;white-space:nowrap}
-.synergy-badge.excellent{background:#e3f4e8;color:#0d5929;border:1px solid var(--green2)}
-.synergy-badge.good{background:#edf7f0;color:#185c35;border:1px solid #7bc698}
-.synergy-badge.neutral{background:#fff9e6;color:#7a5e00;border:1px solid #ffd700}
-.synergy-badge.poor{background:#fff0eb;color:#a83e00;border:1px solid #ff9900}
-.synergy-badge.clash{background:#ffebee;color:#b71c1c;border:1px solid var(--red)}
-.synergy-bar-bg{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:6px}
-.synergy-bar-fill{height:100%;transition:width .3s}
 
 /* Staff Cards & Staff Grid */
 .staff-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px;margin-top:12px}
@@ -1598,7 +1590,7 @@ function paintMatch() {
           ${logo ? `<img class="t-logo md" src="${logo}" alt=""/>` : ''}
           <h3 style="margin:0">${e(sideLineup.name)} · ${e(sideLineup.formation)}</h3>
         </div>
-        ${coachInfo ? `<div class="small muted" style="margin-bottom:10px"><b>Главный тренер:</b> ${e(coachInfo.name)} (${e(coachInfo.styleTitle || coachInfo.nationality)})</div>` : ''}
+        ${coachInfo ? `<div class="small muted" style="margin-bottom:10px"><b>Главный тренер:</b> ${e(coachInfo.name)}${S.me?.role === 'admin' ? ` (стиль: ${e(coachInfo.styleTitle)})` : ` (${e(coachInfo.nationality)})`}</div>` : ''}
         <h4 style="margin:0 0 6px">Стартовый состав (11)</h4>
         ${sideLineup.starters?.length ? sideLineup.starters.map(p => `<div><span class="tag" style="min-width:32px;display:inline-block;text-align:center">${e(p.pos || 'ИГР')}</span> ${e(p.name)}</div>`).join('') : '<div class="muted small">Стартовый состав уточняется ближе к игре.</div>'}
         <h4 style="margin-top:14px;margin-bottom:6px">Запасные</h4>
@@ -2211,6 +2203,7 @@ async function pgClub(app) {
     return;
   }
   const withT = o => S.me.role === 'admin' ? { ...o, teamId: CLUB_TID } : o;
+  const isAdmin = S.me?.role === 'admin';
   const logo = c.team.logo || teamLogo(c.team.id);
 
   app.innerHTML = `
@@ -2232,34 +2225,26 @@ async function pgClub(app) {
     <div class="coach-header">
       <div class="coach-avatar">${e((c.team.coach.name || 'Т').slice(0, 1))}</div>
       <div style="flex:1">
-        <div class="row" style="gap:8px;margin-bottom:4px">
+        <div class="row" style="gap:8px;margin-bottom:4px;flex-wrap:wrap">
           <span class="tag">Главный тренер</span>
           <span class="tag">${e(c.team.coach.nationality)}, ${c.team.coach.age} лет</span>
-          <span class="tag">Любимая схема: ${e(c.team.coach.favoriteFormation)}</span>
-          <span class="synergy-badge ${c.team.synergy?.status || 'neutral'}">${e(c.team.synergy?.statusText || 'Синергия')} (${c.team.synergy?.score || 50}%)</span>
+          ${isAdmin ? `<span class="tag" style="background:#e0f2fe;color:#0369a1;border-color:#bae6fd">Любимая схема: ${e(c.team.coach.favoriteFormation)}</span>` : ''}
+          ${isAdmin ? `<span class="tag" style="background:#fef3c7;color:#92400e;border-color:#fde68a">Стиль: ${e(c.team.coach.styleTitle)}</span>` : ''}
         </div>
         <h2 style="margin:0">${e(c.team.coach.name)}</h2>
-        <div class="small muted" style="margin-top:2px">${e(c.team.coach.styleTitle)} · <i>${e(c.team.coach.quote)}</i></div>
+        ${isAdmin && (c.team.coach.styleDesc || c.team.coach.quote) ? `
+          <div class="small muted" style="margin-top:6px;padding:6px 10px;background:var(--soft);border-radius:6px;border:1px dashed var(--line);line-height:1.4">
+            <b>🔒 Особенности и манера тренера (видно только админу):</b> ${e(c.team.coach.styleDesc || c.team.coach.quote)}
+          </div>` : ''}
       </div>
     </div>
-    ${c.team.synergy ? `
-    <div style="margin-top:14px;border-top:1px dashed var(--line);padding-top:10px">
-      <div class="row sp small">
-        <b>Тактическая синергия с установкой команды</b>
-        <span>xG: ${(c.team.synergy.xgMultiplier * 100).toFixed(0)}% · защита (xGA): ${(c.team.synergy.xgaMultiplier * 100).toFixed(0)}%</span>
-      </div>
-      <div class="synergy-bar-bg">
-        <div class="synergy-bar-fill" style="width:${c.team.synergy.score}%;background:${c.team.synergy.score >= 80 ? 'var(--green2)' : (c.team.synergy.score >= 60 ? 'var(--yellow)' : 'var(--red)')}"></div>
-      </div>
-      <p class="small muted" style="margin:8px 0 0">${e(c.team.synergy.desc)}</p>
-    </div>` : ''}
   </div>` : ''}
 
   ${(c.team.staff && c.team.staff.filter(s => s.role !== 'head').length) ? `
   <div class="panel" style="margin-bottom:16px">
     <div class="row sp" style="margin-bottom:10px">
       <h3 style="margin:0">Тренерский и медицинский штаб (${c.team.staff.filter(s => s.role !== 'head').length})</h3>
-      <span class="muted small">Ассистенты, тренеры вратарей, физподготовка, стандарты и врачи</span>
+      <span class="muted small">${isAdmin ? 'Полные данные специалистов (режим администратора)' : 'Ассистенты, тренеры вратарей, физподготовка и врачи'}</span>
     </div>
     <div class="staff-grid">
       ${c.team.staff.filter(s => s.role !== 'head').map(s => `
@@ -2271,8 +2256,8 @@ async function pgClub(app) {
               <span class="muted small">${s.age ? s.age + ' лет' : ''}${s.nationality ? ' · ' + e(s.nationality) : ''}</span>
             </div>
             <div style="font-weight:700;font-size:14.5px;color:var(--ink)">${e(s.name)}</div>
-            ${s.specialty ? `<div class="small" style="color:var(--deep);margin-top:2px;font-weight:600">${e(s.specialty)}</div>` : ''}
-            ${s.bio ? `<div class="small muted" style="margin-top:4px;line-height:1.35">${e(s.bio)}</div>` : ''}
+            ${isAdmin && s.specialty ? `<div class="small" style="color:var(--deep);margin-top:3px;font-weight:600">🔒 <b>Специализация:</b> ${e(s.specialty)}</div>` : ''}
+            ${isAdmin && s.bio ? `<div class="small muted" style="margin-top:3px;line-height:1.35;border-top:1px dashed var(--line);padding-top:3px">🔒 ${e(s.bio)}</div>` : ''}
           </div>
         </div>
       `).join('')}
