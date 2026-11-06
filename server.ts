@@ -441,7 +441,8 @@ const DEFAULT_INTERNATIONAL_BREAKS = [
   { id: 'ib_sep', name: 'Пауза на сборные (сентябрь)', start: '2026-08-31', end: '2026-09-09' },
   { id: 'ib_oct', name: 'Пауза на сборные (октябрь)', start: '2026-10-05', end: '2026-10-14' },
   { id: 'ib_nov', name: 'Пауза на сборные (ноябрь)', start: '2026-11-09', end: '2026-11-18' },
-  { id: 'ib_mar', name: 'Пауза на сборные (март)', start: '2027-03-22', end: '2027-03-31' }
+  { id: 'ib_mar', name: 'Пауза на сборные (март)', start: '2027-03-22', end: '2027-03-31' },
+  { id: 'ib_jun', name: 'Пауза на сборные (июнь)', start: '2027-06-01', end: '2027-06-11' }
 ];
 
 function isInInternationalBreak(dateStr: string): boolean {
@@ -614,7 +615,15 @@ function load() {
       bio: 'Нажмите «Сделать портрет (ИИ)», чтобы сформировать подробное портфолио ассистента.'
     }));
   }
-  if (!db.internationalBreaks || !db.internationalBreaks.length) db.internationalBreaks = JSON.parse(JSON.stringify(DEFAULT_INTERNATIONAL_BREAKS));
+  if (!db.internationalBreaks || !db.internationalBreaks.length) {
+    db.internationalBreaks = JSON.parse(JSON.stringify(DEFAULT_INTERNATIONAL_BREAKS));
+  } else {
+    for (const def of DEFAULT_INTERNATIONAL_BREAKS) {
+      if (!db.internationalBreaks.some((b: any) => b.id === def.id)) {
+        db.internationalBreaks.push(JSON.parse(JSON.stringify(def)));
+      }
+    }
+  }
   for (const k of ['squads', 'lineups', 'tactics', 'sessions']) {
     if (!db[k]) db[k] = {};
   }
@@ -1685,7 +1694,7 @@ function genSeason(start: string, name: string) {
   while (new Date(cur + 'T12:00:00Z').getUTCDay() !== 6) cur = addDays(cur, 1);
 
   // Генерируем выходные туров с учетом пауз на сборные и зимнего перерыва
-  const weekends: { sat: string; hasCup: boolean; cupStage?: string }[] = [];
+  const weekends: { sat: string; hasCup: boolean; hasRplCup: boolean; cupStage?: string }[] = [];
   const regWeeks: { tue: string; wed: string; thu: string }[] = [];
   const rplWeeks: { tue: string; wed: string; thu: string }[] = [];
 
@@ -1703,6 +1712,7 @@ function genSeason(start: string, name: string) {
     if (!isInInternationalBreak(sat) && !isInInternationalBreak(sun)) {
       const midBreak = isInInternationalBreak(tue) || isInInternationalBreak(wed) || isInInternationalBreak(thu);
       let hasCup = false;
+      let hasRplCup = false;
       let cupStage = '';
 
       // В осенней части (до зимнего перерыва) распределяем 12 кубковых мидвиков (6 регионов и 6 РПЛ, чередуясь)
@@ -1710,17 +1720,19 @@ function genSeason(start: string, name: string) {
         if (cupTurn === 'regions' && regWeeks.length < 6) {
           regWeeks.push({ tue, wed, thu });
           hasCup = true;
+          hasRplCup = false; // играют только команды Пути регионов, в РПЛ кубка нет!
           cupStage = `Путь регионов · ${regWeeks.length}-й раунд`;
           cupTurn = 'rpl';
         } else if (cupTurn === 'rpl' && rplWeeks.length < 6) {
           rplWeeks.push({ tue, wed, thu });
           hasCup = true;
+          hasRplCup = true; // играют команды РПЛ в Пути РПЛ!
           cupStage = `Путь РПЛ · ${rplWeeks.length}-й тур`;
           cupTurn = 'regions';
         }
       }
 
-      weekends.push({ sat, hasCup, cupStage });
+      weekends.push({ sat, hasCup, hasRplCup, cupStage });
       weekIdx++;
     }
     cur = addDays(cur, 7);
@@ -1747,7 +1759,7 @@ function genSeason(start: string, name: string) {
     }
     const all = rounds.concat(rounds.map(p => p.map(([a, b]: any) => [b, a])));
     all.forEach((pairs, ri) => {
-      const wk = weekends[ri] || { sat: addDays(start, ri * 7), hasCup: false };
+      const wk = weekends[ri] || { sat: addDays(start, ri * 7), hasCup: false, hasRplCup: false };
       const sat = wk.sat;
       let order = shuffle(pairs, r);
       const dIdx = order.findIndex(([a, b]: any) => db.derbies.some((x: any) => (x.a === a && x.b === b) || (x.a === b && x.b === a)));
@@ -1758,8 +1770,9 @@ function genSeason(start: string, name: string) {
       order.forEach(([a, b]: any, mi) => {
         let dd = sat, tm = '16:30';
         if (c === 'rpl') {
-          if (!wk.hasCup) {
-            // Нет кубка на неделе: 1 игра в пятницу, в субботу 3 или 4 игры и в воскресенье 4 или 3 игры
+          if (!wk.hasRplCup) {
+            // Без Пути РПЛ на неделе: матчи начинаются с пятницы!
+            // 1 игра в пятницу (19:00), в субботу 3 или 4 игры и в воскресенье 4 или 3 игры
             if (mi === 0) {
               dd = addDays(sat, -1); // Пятница (1 игра)
               tm = '19:00';
@@ -3515,6 +3528,174 @@ app.post('/api/admin/transfer/direct', admin, (req, res) => {
   res.json({ ok: 1, player: p });
 });
 
+/* ───────── Сборная России (паузы, расширенный/итоговый состав, товарищеские матчи, архив) ───────── */
+function ensureNationalTeam() {
+  db.nationalTeam ||= {
+    current: {
+      title: 'Ближайшая пауза на матчи сборных',
+      stage: 'extended',
+      extended: [],
+      final: [],
+      matches: []
+    },
+    archive: []
+  };
+  return db.nationalTeam;
+}
+
+function enrichNationalBreak(brk: any) {
+  const enrichIds = (ids: string[]) => (ids || []).map((id: string) => {
+    const p = player(id);
+    if (!p) return null;
+    return {
+      id: p.id,
+      name: p.name,
+      pos: p.pos,
+      teamId: p.teamId,
+      teamName: tn(p.teamId),
+      teamLogo: teamLogo(p.teamId),
+      ovr: p.ovr || 70,
+      goals: p.goals || 0,
+      assists: p.assists || 0,
+      matches: p.matches || 0,
+      rating: p.rating || 0
+    };
+  }).filter(Boolean);
+  return {
+    ...brk,
+    extendedPlayers: enrichIds(brk.extended),
+    finalPlayers: enrichIds(brk.final)
+  };
+}
+
+app.get('/api/national', (req, res) => {
+  const nt = ensureNationalTeam();
+  const nationalBreaks = (db.internationalBreaks || DEFAULT_INTERNATIONAL_BREAKS).filter((b: any) => b.id.startsWith('ib_'));
+  res.json({
+    current: enrichNationalBreak(nt.current),
+    archive: (nt.archive || []).map(enrichNationalBreak),
+    breaks: nationalBreaks
+  });
+});
+
+app.post('/api/admin/national/generate', admin, async (req, res) => {
+  const nt = ensureNationalTeam();
+  const stage = req.body.stage === 'final' ? 'final' : 'extended';
+  const count = stage === 'final' ? 25 : 40;
+  if (req.body.title) nt.current.title = String(req.body.title).trim();
+
+  let pool = db.players.filter((p: any) => !p.nat || p.nat === 'RUS' || p.nat === 'Россия');
+  if (stage === 'final' && nt.current.extended?.length >= 25) {
+    const extSet = new Set(nt.current.extended);
+    pool = pool.filter((p: any) => extSet.has(p.id));
+  }
+
+  const sortedPool = [...pool].sort((a: any, b: any) =>
+    ((b.rating || 0) * 10 + (b.goals || 0) * 3 + (b.assists || 0) * 2 + (b.ovr || 70) * 0.2) -
+    ((a.rating || 0) * 10 + (a.goals || 0) * 3 + (a.assists || 0) * 2 + (a.ovr || 70) * 0.2)
+  );
+
+  let chosenIds: string[] = [];
+  if (hasLLM() && sortedPool.length > 0) {
+    try {
+      const candidates = sortedPool.slice(0, 75).map((p: any) =>
+        `${p.id}|${p.name}|${p.pos}|${tn(p.teamId)}|OVR:${p.ovr || 70}|М:${p.matches || 0}|Г:${p.goals || 0}|П:${p.assists || 0}|Рейт:${Number(p.rating || 0).toFixed(2)}`
+      ).join('\n');
+      const sys = 'Ты — главный тренер сборной России по футболу. Выбирай состав строго по позиции (минимум 3 вратаря, 8 защитников, 8 полузащитников, 4 нападающих) и текущей игровой форме/статистике.';
+      const prompt = `Сформируй ${stage === 'final' ? 'ИТОГОВЫЙ состав (ровно 25 игроков)' : 'РАСШИРЕННЫЙ состав (ровно 40 игроков)'} сборной России на ближайшую паузу из списка кандидатов:\n${candidates}\n\nВерни JSON: {"ids": ["id1", "id2", ...]}`;
+      const raw = await llm(sys, prompt, { json: true, task: 'national_squad', temp: 0.3, max: 2000 });
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.ids)) {
+        const validSet = new Set(sortedPool.map((p: any) => p.id));
+        chosenIds = parsed.ids.filter((id: string) => validSet.has(id)).slice(0, count);
+      }
+    } catch (e: any) {
+      console.error('national/generate:', e.message);
+    }
+  }
+
+  if (chosenIds.length < Math.min(count, sortedPool.length)) {
+    const have = new Set(chosenIds);
+    for (const p of sortedPool) {
+      if (!have.has(p.id)) {
+        chosenIds.push(p.id);
+        have.add(p.id);
+        if (chosenIds.length >= count) break;
+      }
+    }
+  }
+
+  nt.current.stage = stage;
+  nt.current[stage] = chosenIds;
+  save();
+  res.json({ ok: 1, current: enrichNationalBreak(nt.current) });
+});
+
+app.post('/api/admin/national/squad', admin, (req, res) => {
+  const nt = ensureNationalTeam();
+  const { action, pid, stage } = req.body;
+  const st = stage || nt.current.stage || 'extended';
+  nt.current[st] ||= [];
+  if (action === 'add' && pid) {
+    if (!nt.current[st].includes(pid)) nt.current[st].push(pid);
+  } else if (action === 'remove' && pid) {
+    nt.current[st] = nt.current[st].filter((id: string) => id !== pid);
+  } else if (action === 'stage' && (stage === 'extended' || stage === 'final')) {
+    nt.current.stage = stage;
+  }
+  save();
+  res.json({ ok: 1, current: enrichNationalBreak(nt.current) });
+});
+
+app.post('/api/admin/national/match', admin, (req, res) => {
+  const nt = ensureNationalTeam();
+  const { opponent, date, time, home } = req.body;
+  if (!opponent) return fail(res, 'Укажите соперника');
+  if (!date) return fail(res, 'Укажите дату матча');
+  const nationalBreaks = (db.internationalBreaks || DEFAULT_INTERNATIONAL_BREAKS).filter((b: any) => b.id.startsWith('ib_'));
+  const isValidDate = nationalBreaks.some((b: any) => date >= b.start && date <= b.end);
+  if (!isValidDate) return fail(res, 'Матч сборной может проводиться только в даты официальных пауз на сборные!');
+
+  nt.current.matches ||= [];
+  nt.current.matches.push({
+    id: uid(),
+    opponent: String(opponent).trim(),
+    date: date,
+    time: time || '19:00',
+    home: home !== false
+  });
+  save();
+  res.json({ ok: 1, current: enrichNationalBreak(nt.current) });
+});
+
+app.post('/api/admin/national/match/delete', admin, (req, res) => {
+  const nt = ensureNationalTeam();
+  const matchId = req.body.matchId || req.body.id;
+  if (matchId) {
+    nt.current.matches = (nt.current.matches || []).filter((m: any) => m.id !== matchId);
+    save();
+  }
+  res.json({ ok: 1, current: enrichNationalBreak(nt.current) });
+});
+
+app.post('/api/admin/national/archive', admin, (req, res) => {
+  const nt = ensureNationalTeam();
+  nt.archive ||= [];
+  nt.archive.unshift({
+    ...nt.current,
+    archivedAt: new Date().toISOString().slice(0, 10)
+  });
+  nt.current = {
+    title: 'Следующая пауза на матчи сборных',
+    stage: 'extended',
+    extended: [],
+    final: [],
+    matches: []
+  };
+  save();
+  res.json({ ok: 1 });
+});
+
 /* ───────── проверка состава на реализм (ИИ, только админ) ───────── */
 app.post('/api/admin/check-squad', admin, async (req, res) => {
   const t = team(req.body.teamId);
@@ -3706,6 +3887,78 @@ app.post('/api/admin/transfer-requests/resolve', admin, (req, res) => {
   res.json({ ok: 1 });
 });
 
+function syncRplFridaySchedules() {
+  const rplCupDates = new Set(
+    (db.fixtures || []).filter((f: any) => f.comp === 'cup' && f.cupPath === 'rpl_group').map((f: any) => f.date)
+  );
+  const rplFx = (db.fixtures || []).filter((f: any) => f.comp === 'rpl' && f.status !== 'done');
+  const byRound: Record<number, any[]> = {};
+  rplFx.forEach((f: any) => {
+    byRound[f.round] = byRound[f.round] || [];
+    byRound[f.round].push(f);
+  });
+  let changed = false;
+  for (const [rStr, list] of Object.entries(byRound)) {
+    const ri = Number(rStr) - 1;
+    if (!list || list.length < 8) continue;
+    let sat = list.map((f: any) => f.date).find((d: string) => new Date(d + 'T12:00:00Z').getUTCDay() === 6);
+    if (!sat) {
+      const d0 = list[0].date;
+      const day = new Date(d0 + 'T12:00:00Z').getUTCDay();
+      sat = addDays(d0, (6 - day + 7) % 7);
+    }
+    const tue = addDays(sat, -4), wed = addDays(sat, -3), thu = addDays(sat, -2);
+    const hasRplCup = rplCupDates.has(tue) || rplCupDates.has(wed) || rplCupDates.has(thu);
+
+    if (!hasRplCup) {
+      // Без кубка Пути РПЛ на неделе: первый матч — в пятницу, суббота 3-4, воскресенье 4-3
+      const satCount = (ri % 2 === 0) ? 3 : 4;
+      list.forEach((f: any, mi: number) => {
+        let newDate = sat, newTime = '16:30';
+        if (mi === 0) {
+          newDate = addDays(sat, -1);
+          newTime = '19:00';
+        } else if (mi <= satCount) {
+          newDate = sat;
+          const times = satCount === 3 ? ['14:00', '16:30', '19:00'] : ['13:00', '15:15', '17:30', '20:00'];
+          newTime = times[(mi - 1) % times.length];
+        } else {
+          newDate = addDays(sat, 1);
+          const sunTimes = satCount === 3 ? ['14:00', '16:30', '19:00', '21:00'] : ['14:00', '16:30', '19:00'];
+          newTime = sunTimes[(mi - 1 - satCount) % sunTimes.length];
+        }
+        if (f.date !== newDate || f.time !== newTime) {
+          f.date = newDate;
+          f.time = newTime;
+          changed = true;
+        }
+      });
+    } else {
+      // Есть кубок Пути РПЛ на неделе: с субботы, воскресенье, понедельник
+      list.forEach((f: any, mi: number) => {
+        let newDate = sat, newTime = '16:30';
+        if (mi < 3) {
+          newDate = sat;
+          newTime = ['14:00', '16:30', '19:00'][mi];
+        } else if (mi < 7) {
+          newDate = addDays(sat, 1);
+          newTime = ['14:00', '16:30', '19:00', '21:00'][mi - 3];
+        } else {
+          newDate = addDays(sat, 2);
+          newTime = '19:30';
+        }
+        if (f.date !== newDate || f.time !== newTime) {
+          f.date = newDate;
+          f.time = newTime;
+          changed = true;
+        }
+      });
+    }
+  }
+  if (changed) save();
+}
+
+syncRplFridaySchedules();
 invalidateAgg();
 resumeLive();
 

@@ -136,6 +136,41 @@ a.fxl{color:inherit}a.fxl:hover{background:var(--soft);text-decoration:none}
   .fx .x{grid-column:1/-1;justify-content:flex-start}
 }
 
+/* Календарь событий */
+.cal-container{display:flex;flex-direction:column;gap:12px}
+.cal-nav-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:var(--panel);padding:10px 14px;border-radius:10px;border:1px solid var(--line)}
+.cal-month-pills{display:flex;gap:4px;flex-wrap:wrap;overflow-x:auto;padding-bottom:2px}
+.cal-month-pill{font-size:12px;padding:4px 9px;border-radius:6px;border:1px solid var(--line);background:var(--panel);cursor:pointer;font-weight:600;white-space:nowrap;transition:all .15s}
+.cal-month-pill:hover{background:var(--soft);border-color:var(--green)}
+.cal-month-pill.on{background:var(--green);color:#fff;border-color:var(--green)}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+.cal-weekday{font-size:11.5px;font-weight:700;text-align:center;padding:6px;color:var(--muted);text-transform:uppercase;background:var(--soft);border-radius:6px}
+.cal-cell{min-height:98px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:4px;cursor:pointer;transition:all .15s;position:relative}
+.cal-cell:hover{border-color:var(--green);box-shadow:0 3px 10px rgba(0,0,0,0.07)}
+.cal-cell.other-month{opacity:0.35;background:var(--soft)}
+.cal-cell.selected{border:2px solid var(--green);background:#f2faf4;box-shadow:0 0 0 2px rgba(27,92,63,0.18)}
+.cal-cell.today{border-color:var(--yellow);box-shadow:0 0 0 1px var(--yellow)}
+.cal-cell.has-break{background:#fff5f5;border-color:#fecdd3}
+.cal-cell.has-winter{background:#f0f9ff;border-color:#bae6fd}
+.cal-day-num{font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:space-between;color:var(--ink)}
+.cal-period-badge{font-size:9.5px;padding:1px 4px;border-radius:3px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block}
+.cal-period-badge.break{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
+.cal-period-badge.winter{background:#e0f2fe;color:#075985;border:1px solid #bae6fd}
+.cal-chip{font-size:11px;padding:3px 6px;border-radius:5px;display:flex;align-items:center;gap:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;border:1px solid transparent;line-height:1.2;text-decoration:none}
+.cal-chip:hover{filter:brightness(0.96)}
+.cal-chip.rpl{background:#e9f5ee;color:#144a32;border-color:#c3e4cf}
+.cal-chip.cup{background:#fef3c7;color:#92400e;border-color:#fde68a}
+.cal-chip.media_cup{background:#f3e8ff;color:#6b21a8;border-color:#e9d5ff}
+.cal-chip.fnl{background:#eff6ff;color:#1e40af;border-color:#dbeafe}
+.cal-chip.national{background:#ffe4e6;color:#9f1239;border-color:#fecdd3}
+.cal-chip.other{background:var(--soft);color:var(--ink);border-color:var(--line)}
+.cal-more{font-size:10px;color:var(--muted);font-weight:600;padding:1px 4px}
+@media(max-width:768px){
+  .cal-cell{min-height:74px;padding:3px}
+  .cal-chip{font-size:9.5px;padding:2px 4px}
+  .cal-weekday{font-size:10px;padding:4px 2px}
+}
+
 .score{background:var(--deep);color:#fff;border-radius:12px;padding:22px 18px;margin-bottom:16px;position:relative;overflow:hidden;box-shadow:0 6px 20px rgba(13,47,33,0.3)}
 .score:before{content:"";position:absolute;inset:0;background:repeating-linear-gradient(90deg,#ffffff06 0 60px,transparent 60px 120px)}
 .score>*{position:relative}
@@ -443,6 +478,24 @@ const fmtD = d => {
   }
 };
 
+const fmtDayOfWeek = d => {
+  try {
+    return new Date(d + 'T12:00:00Z').toLocaleDateString('ru-RU', { weekday: 'short' });
+  } catch {
+    return '';
+  }
+};
+
+const addDaysStr = (d, n) => {
+  try {
+    const dt = new Date(d + 'T12:00:00Z');
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  } catch {
+    return d;
+  }
+};
+
 const teamName = id => (S.st?.teams?.find(t => t.id === id) || {}).name || '?';
 const compName = id => (S.st?.comps?.find(c => c.id === id) || {}).name || id;
 const age = (b, d) => {
@@ -472,7 +525,8 @@ function drawChrome() {
     ['#/', 'Главная'],
     ['#/table/rpl', 'Таблицы'],
     ['#/fixtures/rpl', 'Расписание'],
-    ['#/leaders', 'Статистика']
+    ['#/leaders', 'Статистика'],
+    ['#/national', 'Сборная']
   ];
   if (S.me?.role === 'club') links.push(['#/club', 'Мой клуб']);
   if (S.me?.role === 'admin') links.push(['#/club', 'Клуб'], ['#/admin', 'Админка']);
@@ -497,7 +551,7 @@ function route() {
   const [, page, a, b] = (location.hash || '#/').split('/');
   const app = $('#app');
   scrollTo(0, 0);
-  const R = { '': pgHome, undefined: pgHome, table: pgTable, fixtures: pgFixtures, match: pgMatch, leaders: pgLeaders, regulations: pgHome, club: pgClub, admin: pgAdmin, login: pgLogin };
+  const R = { '': pgHome, undefined: pgHome, table: pgTable, fixtures: pgFixtures, match: pgMatch, leaders: pgLeaders, national: pgNational, regulations: pgHome, club: pgClub, admin: pgAdmin, login: pgLogin };
   (R[page] || pgHome)(app, a, b).catch(x => {
     app.innerHTML = `<div class="panel warn">${e(x.message)}</div>`;
   });
@@ -943,8 +997,263 @@ async function pgTable(app, comp = 'rpl') {
 }
 
 let CUP_FX_FILTER = 'all';
+let FX_VIEW = 'rounds'; // 'rounds' | 'calendar'
+let CAL_YEAR = 2026;
+let CAL_MONTH = 6; // 0-indexed: 6 is July 2026
+let CAL_SELECTED_DAY = null;
+let CAL_COMP_FILTER = 'all';
+
+const MONTH_NAMES = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+const SEASON_MONTHS = [
+  { y: 2026, m: 6, label: 'Июл \'26' },
+  { y: 2026, m: 7, label: 'Авг \'26' },
+  { y: 2026, m: 8, label: 'Сен \'26' },
+  { y: 2026, m: 9, label: 'Окт \'26' },
+  { y: 2026, m: 10, label: 'Ноя \'26' },
+  { y: 2026, m: 11, label: 'Дек \'26' },
+  { y: 2027, m: 1, label: 'Фев \'27' },
+  { y: 2027, m: 2, label: 'Мар \'27' },
+  { y: 2027, m: 3, label: 'Апр \'27' },
+  { y: 2027, m: 4, label: 'Май \'27' },
+  { y: 2027, m: 5, label: 'Июн \'27' }
+];
 
 async function pgFixtures(app, comp = 'rpl', round) {
+  const currentCompObj = (S.st?.comps || []).find(c => c.id === comp);
+  const title = currentCompObj?.name || 'Расписание';
+  const logoUrl = compLogo(comp);
+
+  const infoBadge = comp === 'rpl'
+    ? `<div class="muted small" style="margin-bottom:12px;background:var(--soft);padding:8px 12px;border-radius:6px;border:1px solid var(--line)">📅 <b>Календарь РПЛ:</b> без кубка Пути РПЛ на неделе — матчи начинаются с пятницы: Пт (1 матч 19:00), Сб (3–4 матча), Вс (3–4 матча); в кубковые недели — Сб (3 матча), Вс (4 матча), Пн (1 матч). Матчи не пересекаются с паузами на сборные и зимним перерывом.</div>`
+    : (comp === 'cup'
+      ? `<div class="muted small" style="margin-bottom:12px;background:var(--soft);padding:8px 12px;border-radius:6px;border:1px solid var(--line)">🏆 <b>FONBET Кубок России:</b> недели Пути регионов и Пути РПЛ строго чередуются через неделю. В Пути РПЛ каждый тур: Вт (2 матча), Ср (4 матча), Чт (2 матча). Плей-офф составляется только после завершения группового этапа.</div>`
+      : '');
+
+  const viewSwitcher = `
+  <div class="row sp" style="margin-bottom:12px;align-items:center;flex-wrap:wrap;gap:8px">
+    <div class="tabs" style="margin:0">
+      <button class="${FX_VIEW === 'rounds' ? 'on' : ''}" data-fxv="rounds">📋 По турам</button>
+      <button class="${FX_VIEW === 'calendar' ? 'on' : ''}" data-fxv="calendar">🗓️ Календарик событий</button>
+    </div>
+  </div>`;
+
+  if (FX_VIEW === 'calendar') {
+    const [allRaw, ntData] = await Promise.all([
+      api('/fixtures'),
+      api('/national')
+    ]);
+
+    const activeFilter = CAL_COMP_FILTER;
+    const breaks = ntData.breaks || [];
+
+    // Определяем сетку выбранного месяца
+    const firstDayDate = new Date(Date.UTC(CAL_YEAR, CAL_MONTH, 1));
+    const startDow = (firstDayDate.getUTCDay() + 6) % 7; // 0 for Mon, 6 for Sun
+    const daysInMonth = new Date(Date.UTC(CAL_YEAR, CAL_MONTH + 1, 0)).getUTCDate();
+    const daysInPrevMonth = new Date(Date.UTC(CAL_YEAR, CAL_MONTH, 0)).getUTCDate();
+
+    // Группируем матчи по датам
+    const matchesByDate = {};
+    (allRaw || []).forEach(f => {
+      if (!f.date) return;
+      if (activeFilter !== 'all' && f.comp !== activeFilter) return;
+      matchesByDate[f.date] = matchesByDate[f.date] || [];
+      matchesByDate[f.date].push(f);
+    });
+
+    // Добавляем товарищеские матчи сборной
+    if (activeFilter === 'all' || activeFilter === 'national') {
+      (ntData?.current?.matches || []).forEach(m => {
+        if (!m.date) return;
+        matchesByDate[m.date] = matchesByDate[m.date] || [];
+        matchesByDate[m.date].push({
+          id: 'nt_' + m.id,
+          comp: 'national',
+          date: m.date,
+          time: m.time,
+          label: 'Товарищеский матч',
+          homeName: m.home ? 'Россия' : m.opponent,
+          awayName: m.home ? m.opponent : 'Россия',
+          status: 'scheduled',
+          isNational: true
+        });
+      });
+    }
+
+    // Рендерим ячейки календаря
+    const cells = [];
+    // Дни предыдущего месяца
+    for (let p = startDow - 1; p >= 0; p--) {
+      const dNum = daysInPrevMonth - p;
+      cells.push(`<div class="cal-cell other-month"><div class="cal-day-num">${dNum}</div></div>`);
+    }
+
+    // Дни текущего месяца
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateStr = `${CAL_YEAR}-${String(CAL_MONTH + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      const isSel = CAL_SELECTED_DAY === dateStr;
+      const curBreak = breaks.find(b => dateStr >= b.start && dateStr <= b.end);
+      const isWinter = dateStr >= '2026-12-14' && dateStr <= '2027-02-27';
+      const mList = matchesByDate[dateStr] || [];
+
+      let cellClasses = 'cal-cell';
+      if (isSel) cellClasses += ' selected';
+      if (curBreak) cellClasses += ' has-break';
+      if (isWinter) cellClasses += ' has-winter';
+
+      let periodBadge = '';
+      if (curBreak) periodBadge = `<span class="cal-period-badge break" title="${e(curBreak.name)}">🇷🇺 Сборные</span>`;
+      else if (isWinter) periodBadge = `<span class="cal-period-badge winter" title="Зимний перерыв в РПЛ">❄️ Перерыв</span>`;
+
+      const visibleChips = mList.slice(0, 3).map(f => {
+        const cClass = f.comp === 'rpl' ? 'rpl' : (f.comp === 'cup' ? 'cup' : (f.comp === 'media_cup' ? 'media_cup' : (f.comp === 'fnl' ? 'fnl' : (f.comp === 'national' ? 'national' : 'other'))));
+        const scoreOrTime = f.status === 'done' ? `${f.hg}:${f.ag}` : (f.time || '19:00');
+        const shortMatch = f.isNational
+          ? `🇷🇺 ${f.homeName} — ${f.awayName}`
+          : `${f.homeName} ${scoreOrTime} ${f.awayName}`;
+        return `<a class="cal-chip ${cClass}" href="${f.isNational ? '#/national' : '#/match/' + f.id}" title="${e(f.label || '')}: ${e(f.homeName)} — ${e(f.awayName)}">${e(shortMatch)}</a>`;
+      }).join('');
+
+      const moreCount = mList.length > 3 ? `<div class="cal-more">+ ещё ${mList.length - 3}</div>` : '';
+
+      cells.push(`
+        <div class="${cellClasses}" data-cal-day="${dateStr}">
+          <div class="cal-day-num">
+            <span>${d}</span>
+            ${periodBadge}
+          </div>
+          <div style="display:flex;flex-direction:column;gap:3px;margin-top:2px;overflow:hidden">
+            ${visibleChips}
+            ${moreCount}
+          </div>
+        </div>
+      `);
+    }
+
+    // Если день выбран, рендерим панель событий дня
+    let selectedDayHtml = '';
+    if (CAL_SELECTED_DAY) {
+      const curBreak = breaks.find(b => CAL_SELECTED_DAY >= b.start && CAL_SELECTED_DAY <= b.end);
+      const isWinter = CAL_SELECTED_DAY >= '2026-12-14' && CAL_SELECTED_DAY <= '2027-02-27';
+      const dayList = matchesByDate[CAL_SELECTED_DAY] || [];
+      selectedDayHtml = `
+      <div class="panel" style="margin-top:16px;border:1.5px solid var(--green)">
+        <div class="row sp" style="margin-bottom:10px">
+          <h3 style="margin:0">События на ${fmtD(CAL_SELECTED_DAY)} (${fmtDayOfWeek(CAL_SELECTED_DAY)})</h3>
+          <span class="tag">${dayList.length} событий</span>
+        </div>
+        ${curBreak ? `<div class="panel" style="background:#fee2e2;border:1px solid #fca5a5;padding:8px 12px;margin-bottom:10px"><b>🇷🇺 ${e(curBreak.name)}</b>: пауза в чемпионатах на матчи национальных сборных.</div>` : ''}
+        ${isWinter ? `<div class="panel" style="background:#e0f2fe;border:1px solid #bae6fd;padding:8px 12px;margin-bottom:10px"><b>❄️ Зимний перерыв в РПЛ</b>: клубы проводят сборы и товарищеские матчи.</div>` : ''}
+        ${dayList.length ? dayList.map(f => {
+          if (f.isNational) {
+            return `<div class="row sp" style="padding:10px 12px;background:var(--soft);border-radius:8px;margin-bottom:8px">
+              <div><span class="tag live" style="background:#b91c1c">🇷🇺 Сборная России</span> <b>${e(f.homeName)} — ${e(f.awayName)}</b> · ${e(f.time)}</div>
+              <a class="btn alt sm" href="#/national">В раздел Сборная</a>
+            </div>`;
+          }
+          return fxRow(f);
+        }).join('') : '<div class="empty">Матчей и событий на этот день нет.</div>'}
+      </div>`;
+    }
+
+    app.innerHTML = `
+    <div class="comp-banner">
+      <img src="${logoUrl}" alt="${e(title)}" class="comp-banner-logo" onerror="this.style.display='none'"/>
+      <div>
+        <h1 class="comp-banner-title">Календарь футбольных событий</h1>
+        <div class="comp-banner-sub">Сезон ${e(S.st?.season || '2026/27')} · Все матчи, кубковые мидвики, паузы на сборные и зимний перерыв</div>
+      </div>
+    </div>
+    ${viewSwitcher}
+    ${infoBadge}
+
+    <div class="cal-container">
+      <div class="cal-nav-bar">
+        <div class="row" style="gap:8px;align-items:center">
+          <button class="btn alt sm" id="cal_prev">← Предыдущий</button>
+          <b style="font-size:17px;font-family:Unbounded,sans-serif">${MONTH_NAMES[CAL_MONTH]} ${CAL_YEAR}</b>
+          <button class="btn alt sm" id="cal_next">Следующий →</button>
+        </div>
+        <div class="row" style="gap:8px;align-items:center">
+          <label for="cal_filter" class="muted small" style="margin:0;font-weight:600">Турнир:</label>
+          <select id="cal_filter" style="width:auto;padding:5px 10px;border-radius:6px;border:1px solid var(--line);background:var(--panel);font-weight:600">
+            <option value="all" ${activeFilter === 'all' ? 'selected' : ''}>Все турниры и события</option>
+            <option value="rpl" ${activeFilter === 'rpl' ? 'selected' : ''}>РПЛ</option>
+            <option value="cup" ${activeFilter === 'cup' ? 'selected' : ''}>FONBET Кубок России</option>
+            <option value="media_cup" ${activeFilter === 'media_cup' ? 'selected' : ''}>Winline Кубок Лиги</option>
+            <option value="fnl" ${activeFilter === 'fnl' ? 'selected' : ''}>Первая лига</option>
+            <option value="national" ${activeFilter === 'national' ? 'selected' : ''}>Сборная России (паузы и матчи)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="cal-month-pills">
+        ${SEASON_MONTHS.map(m => `
+          <button class="cal-month-pill ${m.y === CAL_YEAR && m.m === CAL_MONTH ? 'on' : ''}" data-set-ym="${m.y}-${m.m}">${m.label}</button>
+        `).join('')}
+      </div>
+
+      <div class="cal-grid">
+        <div class="cal-weekday">Пн</div>
+        <div class="cal-weekday">Вт</div>
+        <div class="cal-weekday">Ср</div>
+        <div class="cal-weekday">Чт</div>
+        <div class="cal-weekday">Пт</div>
+        <div class="cal-weekday">Сб</div>
+        <div class="cal-weekday">Вс</div>
+        ${cells.join('')}
+      </div>
+
+      ${selectedDayHtml}
+
+      <div class="table-legend" style="margin-top:10px">
+        <span class="table-legend-item"><span class="table-legend-dot" style="background:#1b5c3f"></span> <b>РПЛ</b> (с пятницы без кубка на неделе)</span>
+        <span class="table-legend-item"><span class="table-legend-dot" style="background:#d97706"></span> <b>FONBET Кубок России</b> (мидвики)</span>
+        <span class="table-legend-item"><span class="table-legend-dot" style="background:#7e22ce"></span> <b>Winline Кубок Лиги</b></span>
+        <span class="table-legend-item"><span class="table-legend-dot" style="background:#2563eb"></span> <b>Первая лига</b></span>
+        <span class="table-legend-item"><span class="table-legend-dot" style="background:#e11d48"></span> <b>🇷🇺 Сборные</b></span>
+        <span class="table-legend-item"><span class="table-legend-dot" style="background:#0284c7"></span> <b>❄️ Зимний перерыв</b></span>
+      </div>
+    </div>`;
+
+    app.querySelectorAll('[data-fxv]').forEach(b => b.onclick = () => {
+      FX_VIEW = b.dataset.fxv;
+      pgFixtures(app, comp);
+    });
+
+    $('#cal_prev').onclick = () => {
+      CAL_MONTH--;
+      if (CAL_MONTH < 0) { CAL_MONTH = 11; CAL_YEAR--; }
+      pgFixtures(app, comp);
+    };
+
+    $('#cal_next').onclick = () => {
+      CAL_MONTH++;
+      if (CAL_MONTH > 11) { CAL_MONTH = 0; CAL_YEAR++; }
+      pgFixtures(app, comp);
+    };
+
+    $('#cal_filter').onchange = () => {
+      CAL_COMP_FILTER = $('#cal_filter').value;
+      pgFixtures(app, comp);
+    };
+
+    app.querySelectorAll('[data-set-ym]').forEach(b => b.onclick = () => {
+      const [y, m] = b.dataset.setYm.split('-').map(Number);
+      CAL_YEAR = y;
+      CAL_MONTH = m;
+      pgFixtures(app, comp);
+    });
+
+    app.querySelectorAll('[data-cal-day]').forEach(b => b.onclick = () => {
+      CAL_SELECTED_DAY = b.dataset.calDay;
+      pgFixtures(app, comp);
+    });
+
+    return;
+  }
+
+  // Режим отображения по турам (Round view)
   const rawAll = await api('/fixtures?comp=' + comp);
   let all = rawAll;
   if (comp === 'cup' && CUP_FX_FILTER === 'rpl') {
@@ -957,15 +1266,6 @@ async function pgFixtures(app, comp = 'rpl', round) {
   let cur = round ? decodeURIComponent(round) : (all.find(f => f.status !== 'done') || all[all.length - 1] || {}).label;
   if (!rounds.includes(cur)) cur = rounds[0];
   const list = all.filter(f => f.label === cur), i = rounds.indexOf(cur);
-  const currentCompObj = (S.st?.comps || []).find(c => c.id === comp);
-  const title = currentCompObj?.name || 'Расписание';
-  const logoUrl = compLogo(comp);
-
-  const infoBadge = comp === 'rpl'
-    ? `<div class="muted small" style="margin-bottom:12px;background:var(--soft);padding:8px 12px;border-radius:6px;border:1px solid var(--line)">📅 <b>Календарь РПЛ:</b> без кубка на неделе — Пт (1 матч), Сб (3–4 матча), Вс (3–4 матча); в кубковые недели — Сб (3 матча), Вс (4 матча), Пн (1 матч). Матчи не пересекаются с паузами на сборные (сентябрь, октябрь, ноябрь, март) и зимним перерывом.</div>`
-    : (comp === 'cup'
-      ? `<div class="muted small" style="margin-bottom:12px;background:var(--soft);padding:8px 12px;border-radius:6px;border:1px solid var(--line)">🏆 <b>FONBET Кубок России:</b> недели Пути регионов и Пути РПЛ строго чередуются через неделю. В Пути РПЛ каждый тур: Вт (2 матча), Ср (4 матча), Чт (2 матча). Плей-офф составляется только после завершения группового этапа.</div>`
-      : '');
 
   const rplCount = rawAll.filter(f => f.cupPath === 'rpl_group' || f.cupPath === 'rpl_playoff').length;
   const regCount = rawAll.filter(f => f.cupPath === 'regions_qual' || f.cupPath === 'regions_playoff').length;
@@ -984,10 +1284,16 @@ async function pgFixtures(app, comp = 'rpl', round) {
       <div class="comp-banner-sub">${e(currentCompObj?.level || 'Сезон ' + (S.st?.season || '2026/27'))}</div>
     </div>
   </div>
+  ${viewSwitcher}
   ${renderCompTabs(comp, 'fixtures')}
   ${infoBadge}
   ${cupFilterTabs}
   ${all.length ? `<div class="row sp" style="margin-bottom:12px"><button class="btn alt sm" id="pv" ${i <= 0 ? 'disabled' : ''}>← Назад</button><b>${e(cur)}</b><button class="btn alt sm" id="nx" ${i >= rounds.length - 1 ? 'disabled' : ''}>Вперёд →</button></div><div class="panel">${list.map(fxRow).join('')}</div>` : '<div class="empty panel">Расписание ещё не создано — администратор сделает это в разделе «Админка».</div>'}`;
+
+  app.querySelectorAll('[data-fxv]').forEach(b => b.onclick = () => {
+    FX_VIEW = b.dataset.fxv;
+    pgFixtures(app, comp);
+  });
   app.querySelectorAll('[data-nav]').forEach(b => b.onclick = () => location.hash = '#/fixtures/' + b.dataset.nav);
   app.querySelectorAll('[data-cf]').forEach(b => b.onclick = () => {
     CUP_FX_FILTER = b.dataset.cf;
@@ -2615,6 +2921,178 @@ async function pgAdmin(app) {
       re();
     };
   }
+}
+
+let NT_TAB = 'current';
+async function pgNational(app) {
+  const isAdmin = S.me?.role === 'admin';
+  const [data, plData] = await Promise.all([
+    api('/national'),
+    isAdmin ? api('/admin/players?q=') : Promise.resolve({ players: [] })
+  ]);
+  const cur = data.current || { title: 'Ближайшая пауза на матчи сборных', stage: 'extended', extendedPlayers: [], finalPlayers: [], matches: [] };
+  const archive = data.archive || [];
+  const allPlayers = plData.players || [];
+
+  const activeStage = cur.stage === 'final' ? 'final' : 'extended';
+  const activeList = activeStage === 'final' ? (cur.finalPlayers || []) : (cur.extendedPlayers || []);
+
+  const renderPlayersTable = (list, canEdit) => {
+    if (!list.length) return '<div class="empty">Состав на ближайшую паузу ещё не опубликован.</div>';
+    return `<div class="wrap"><table>
+      <thead><tr><th>#</th><th class="l">Игрок</th><th>Поз.</th><th class="l">Клуб</th><th>Матчи</th><th>Голы</th><th>Пасы</th><th>Рейтинг</th>${canEdit ? '<th></th>' : ''}</tr></thead>
+      <tbody>
+        ${list.map((p, i) => `<tr>
+          <td>${i + 1}</td>
+          <td class="l"><b>${e(p.name)}</b></td>
+          <td><span class="tag">${e(p.pos)}</span></td>
+          <td class="l"><div class="t-cell">${p.teamLogo ? `<img class="t-logo" src="${p.teamLogo}" alt=""/>` : ''}<span>${e(p.teamName)}</span></div></td>
+          <td>${p.matches || 0}</td>
+          <td>${p.goals || 0}</td>
+          <td>${p.assists || 0}</td>
+          <td><b>${Number(p.rating || 0).toFixed(2)}</b></td>
+          ${canEdit ? `<td><button class="btn alt sm" data-nt-rem="${p.id}">Убрать</button></td>` : ''}
+        </tr>`).join('')}
+      </tbody>
+    </table></div>`;
+  };
+
+  const breaks = (data.breaks || []).filter(b => b.id.startsWith('ib_'));
+  const breakDateOptions = breaks.map(b => {
+    const opts = [];
+    let curD = b.start;
+    while (curD <= b.end) {
+      opts.push(`<option value="${curD}">${fmtD(curD)} (${fmtDayOfWeek(curD)})</option>`);
+      curD = addDaysStr(curD, 1);
+    }
+    return `<optgroup label="${e(b.name)} (${fmtD(b.start)} — ${fmtD(b.end)})">${opts.join('')}</optgroup>`;
+  }).join('');
+
+  const renderMatches = (matches, canEdit) => {
+    if (!matches || !matches.length) return '<div class="empty">Товарищеские матчи на эту паузу ещё не назначены.</div>';
+    return `<div style="display:grid;gap:8px">
+      ${matches.map(m => `<div class="row sp" style="padding:10px 14px;background:var(--soft);border-radius:8px">
+        <div class="row" style="gap:10px">
+          <span class="small muted">${fmtD(m.date)} (${fmtDayOfWeek(m.date)}) · ${e(m.time)}</span>
+          <b>${m.home ? `Россия — ${e(m.opponent)}` : `${e(m.opponent)} — Россия`}</b>
+        </div>
+        <div class="row" style="gap:8px">
+          <span class="tag">Товарищеский матч</span>
+          ${canEdit ? `<button class="btn alt sm" data-nt-del-match="${m.id}" title="Удалить матч" style="color:#ef4444;border-color:rgba(239,68,68,0.3)">✕</button>` : ''}
+        </div>
+      </div>`).join('')}
+    </div>`;
+  };
+
+  let body = '';
+  if (NT_TAB === 'current') {
+    body = `
+      <div class="panel">
+        <div class="row sp" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
+          <div>
+            <h3 style="margin:0">${e(cur.title)}</h3>
+            <div class="small muted">${activeStage === 'final' ? 'Итоговый состав (25 игроков)' : 'Расширенный состав (40 игроков)'} · Вызвано: ${activeList.length}</div>
+          </div>
+          ${isAdmin ? `<div class="row" style="gap:6px">
+            <button class="btn ${activeStage === 'extended' ? '' : 'alt'} sm" data-nt-stage="extended">Расширенный (${(cur.extendedPlayers || []).length})</button>
+            <button class="btn ${activeStage === 'final' ? '' : 'alt'} sm" data-nt-stage="final">Итоговый (${(cur.finalPlayers || []).length})</button>
+          </div>` : ''}
+        </div>
+        ${renderPlayersTable(activeList, isAdmin)}
+      </div>
+
+      <div class="panel">
+        <h3 style="margin:0 0 10px">Товарищеские матчи в эту паузу</h3>
+        ${renderMatches(cur.matches, isAdmin)}
+      </div>
+
+      ${isAdmin ? `
+      <div class="panel" style="border:1.5px solid var(--green)">
+        <h3 style="margin:0 0 10px">Управление сборной (Админ)</h3>
+        <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px">
+          <input id="nt_title" value="${e(cur.title)}" placeholder="Название паузы (например: Ноябрьский сбор 2026)" style="flex:1;min-width:240px">
+          <button class="btn" id="nt_gen_ext">Сформировать расширенный (40) ИИ</button>
+          <button class="btn" id="nt_gen_fin">Сформировать итоговый (25) ИИ</button>
+          <button class="btn alt" id="nt_arch_btn">В архив</button>
+        </div>
+        <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px">
+          <select id="nt_add_pid" style="flex:1;min-width:240px">
+            ${allPlayers.slice(0, 400).map(p => `<option value="${p.id}">${e(p.name)} (${p.pos}, ${e(teamName(p.teamId))})</option>`).join('')}
+          </select>
+          <button class="btn alt" id="nt_add_btn">Добавить игрока в состав</button>
+        </div>
+        <div style="margin-bottom:6px;font-size:12px;color:var(--muted)">
+          ℹ️ <b>Товарищеские матчи сборной:</b> даты строго ограничены официальными международными окнами ФИФА
+        </div>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <input id="nt_opp" placeholder="Соперник (например: Сербия, Камерун)" style="flex:2;min-width:180px">
+          <select id="nt_date" style="flex:2;min-width:220px">
+            ${breakDateOptions || '<option value="2026-11-14">2026-11-14</option>'}
+          </select>
+          <input id="nt_time" value="19:00" style="width:80px">
+          <button class="btn alt" id="nt_add_match">Добавить товарищеский матч</button>
+        </div>
+      </div>` : ''}`;
+  } else {
+    body = archive.length ? archive.map(a => {
+      const list = (a.finalPlayers && a.finalPlayers.length) ? a.finalPlayers : (a.extendedPlayers || []);
+      return `<div class="panel">
+        <div class="row sp" style="margin-bottom:10px">
+          <b>${e(a.title)}</b>
+          <span class="small muted">Архив · ${e(a.archivedAt || '')} · Игроков: ${list.length}</span>
+        </div>
+        ${renderMatches(a.matches)}
+        <div style="margin-top:10px">${renderPlayersTable(list, false)}</div>
+      </div>`;
+    }).join('') : '<div class="panel"><div class="empty">Архив сборов пуст.</div></div>';
+  }
+
+  app.innerHTML = `
+  <div class="comp-banner">
+    <div>
+      <h1 class="comp-banner-title">🇷🇺 Сборная России</h1>
+      <div class="comp-banner-sub">Вызов игроков на международную паузу, товарищеские матчи и архив сборов</div>
+    </div>
+  </div>
+  <div class="tabs" style="margin-bottom:16px">
+    <button data-nt-tab="current" class="${NT_TAB === 'current' ? 'on' : ''}">Ближайшая пауза</button>
+    <button data-nt-tab="archive" class="${NT_TAB === 'archive' ? 'on' : ''}">Архив (${archive.length})</button>
+  </div>
+  ${body}`;
+
+  app.querySelectorAll('[data-nt-tab]').forEach(b => b.onclick = () => { NT_TAB = b.dataset.ntTab; pgNational(app); });
+  app.querySelectorAll('[data-nt-stage]').forEach(b => b.onclick = async () => {
+    await act(() => api('/admin/national/squad', { action: 'stage', stage: b.dataset.ntStage }));
+    pgNational(app);
+  });
+  app.querySelectorAll('[data-nt-rem]').forEach(b => b.onclick = async () => {
+    await act(() => api('/admin/national/squad', { action: 'remove', pid: b.dataset.ntRem }), 'Игрок убран из списка');
+    pgNational(app);
+  });
+  if ($('#nt_gen_ext')) $('#nt_gen_ext').onclick = async () => {
+    const r = await act(() => api('/admin/national/generate', { stage: 'extended', title: $('#nt_title').value }), 'Расширенный состав (40) сформирован');
+    if (r) pgNational(app);
+  };
+  if ($('#nt_gen_fin')) $('#nt_gen_fin').onclick = async () => {
+    const r = await act(() => api('/admin/national/generate', { stage: 'final', title: $('#nt_title').value }), 'Итоговый состав (25) сформирован');
+    if (r) pgNational(app);
+  };
+  if ($('#nt_add_btn')) $('#nt_add_btn').onclick = async () => {
+    const r = await act(() => api('/admin/national/squad', { action: 'add', pid: $('#nt_add_pid').value }), 'Игрок добавлен в сборную');
+    if (r) pgNational(app);
+  };
+  if ($('#nt_add_match')) $('#nt_add_match').onclick = async () => {
+    const r = await act(() => api('/admin/national/match', { opponent: $('#nt_opp').value, date: $('#nt_date').value, time: $('#nt_time').value, home: true }), 'Товарищеский матч добавлен');
+    if (r) pgNational(app);
+  };
+  app.querySelectorAll('[data-nt-del-match]').forEach(b => b.onclick = async () => {
+    await act(() => api('/admin/national/match/delete', { matchId: b.dataset.ntDelMatch }), 'Товарищеский матч удалён');
+    pgNational(app);
+  });
+  if ($('#nt_arch_btn')) $('#nt_arch_btn').onclick = async () => {
+    const r = await act(() => api('/admin/national/archive', {}), 'Сбор отправлен в архив');
+    if (r) pgNational(app);
+  };
 }
 
 boot();
