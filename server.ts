@@ -881,7 +881,7 @@ function provList() {
   const g = process.env.GEMINI_API_KEY || k.gemini;
   const q = process.env.GROQ_API_KEY || k.groq;
   const o = process.env.OPENROUTER_API_KEY || k.openrouter;
-  if (g) L.push({ n: 'gemini', key: g, model: process.env.GEMINI_MODEL || m.gemini || 'gemini-2.5-flash', max: 32000 });
+  if (g) L.push({ n: 'gemini', key: g, model: process.env.GEMINI_MODEL || m.gemini || 'gemini-3.8-flash', max: 32000 });
   if (q) L.push({ n: 'groq', key: q, base: 'https://api.groq.com/openai/v1', model: process.env.GROQ_MODEL || m.groq || 'openai/gpt-oss-120b', max: 8000 });
   if (o) L.push({ n: 'openrouter', key: o, base: 'https://openrouter.ai/api/v1', model: process.env.OPENROUTER_MODEL || m.openrouter || 'openrouter/free', max: 8000 });
   return L;
@@ -3099,7 +3099,7 @@ app.post('/api/admin/referee', admin, (req, res) => {
       city: city || 'Москва',
       age: Number(age) || 38,
       style: style || 'balanced',
-      styleDesc: styleDesc || 'Сбалансированный: ровное судейство',
+      styleDesc: styleDesc || bio || 'Индивидуальная манера судейства',
       leagues: Array.isArray(leagues) && leagues.length ? leagues : ['rpl', 'cup'],
       rating: Number(rating) || 8.0,
       matches: 0,
@@ -3139,19 +3139,26 @@ app.post('/api/admin/referee/portfolio', admin, async (req, res) => {
   if (!r) return fail(res, 'Судья не найден');
   if (hasLLM()) {
     try {
-      const prompt = `Составь актуальное профессиональное портфолио футбольного арбитра: ${r.name} (город: ${r.city}, возраст: ${r.age || 40} лет, стиль судейства: ${r.styleDesc || r.style}, лиги: ${(r.leagues || []).join(', ').toUpperCase()}).
-Укажи его реальную карьеру, известные настоящие матчи, которые он судил в РПЛ/Кубке России/еврокубках, манеру общения с игроками и сильные стороны. Напиши 3-4 содержательных предложения на русском языке.`;
-      const bio = await callProv(provList()[0], '', prompt, { temp: 0.5, max: 600 });
+      const sys = 'Ты — опытный футбольный аналитик и инспектор судейства РФС. Пиши развёрнуто, живым профессиональным языком, без канцелярита и банальных ярлыков вроде «сбалансированный» или «ровное судейство».';
+      const prompt = `Найди в интернете реальную информацию о российском футбольном арбитре: ${r.name} (город: ${r.city}, лиги: ${(r.leagues || []).join(', ').toUpperCase()}).
+Представь этого арбитра так, как будто ты подробно рассказываешь о нём тренеру или спортивному директору перед важным матчем.
+Напиши большой, осмысленный и логический рассказ (не менее 15 подробных предложений!) о том, кто этот судья и как именно он судит в реальной жизни:
+1. Какой он категории (ФИФА, всероссийская, первая и т.д.), сколько лет судит на профессиональном уровне и сколько примерно матчей отсудил в РПЛ, ФНЛ и Кубке России.
+2. Как он контролирует игру: держит ли нить матча в руках или порой теряет контроль, как реагирует на высокий темп и давление трибун.
+3. Какая у него планка фолов: даёт ли вести жёсткую силовую борьбу или свистит малейшие контакты, как относится к тактическим фолам в центре поля.
+4. Как работает с карточками: часто ли достаёт жёлтые и красные, поспешные ли решения принимает или долго терпит, как наказывает за споры, симуляции и затяжку времени.
+5. Как действует в штрафной площади и с ВАР: охотно ли ставит пенальти, любит ли ждать подсказок ВАР у монитора или уверенно решает сам.
+6. Какие известные матчи или резонансные эпизоды были в его карьере, и как он общается с игроками и тренерами у бровки.`;
+      const bio = await llm(sys, prompt, { json: false, task: 'referee_portfolio', temp: 0.5, max: 2500, grounded: true });
       r.bio = bio.trim();
       save();
       return res.json({ ok: 1, bio: r.bio });
     } catch (e: any) {
       console.error('referee/portfolio:', e.message);
+      return fail(res, 'Ошибка генерации портрета: ' + e.message);
     }
   }
-  r.bio = `${r.name} (${r.city}) — опытный арбитр (${(r.leagues || []).join(', ').toUpperCase()}), известный по работе на ключевых матчах чемпионата и Кубка России. Стиль: ${r.styleDesc || r.style}.`;
-  save();
-  res.json({ ok: 1, bio: r.bio });
+  return fail(res, 'Не настроен ключ нейросети для генерации портрета');
 });
 
 app.post('/api/admin/referees/assign-round', admin, (req, res) => {

@@ -2286,13 +2286,7 @@ async function pgAdmin(app) {
         <div class="row" style="gap:8px;flex-wrap:wrap">
           <input id="rf_name" placeholder="Имя и фамилия" style="flex:2;min-width:180px">
           <input id="rf_city" placeholder="Город" style="flex:1;min-width:120px">
-          <select id="rf_style" style="width:170px">
-            <option value="balanced">Сбалансированный</option>
-            <option value="strict">Строгий</option>
-            <option value="liberal">Либеральный</option>
-            <option value="european">Европейский</option>
-            <option value="principled">Принципиальный</option>
-          </select>
+          <input id="rf_styleDesc" placeholder="Подробный портрет / манера судейства" style="flex:2;min-width:240px">
           <input id="rf_leagues" value="rpl,cup,friendly" placeholder="Лиги (rpl,fnl,cup,friendly)" style="flex:1;min-width:160px">
           <button class="btn alt" id="rf_add">Добавить судью</button>
         </div>
@@ -2301,13 +2295,12 @@ async function pgAdmin(app) {
         <h3>Таблица рейтинга главных и резервных арбитров (${refs.length})</h3>
         <p class="muted small">Рейтинг формируется по симулированным матчам (изначально 0.00). На важные матчи назначаются лучшие арбитры.</p>
         <table>
-          <thead><tr><th>#</th><th class="l">Арбитр</th><th class="l">Город</th><th class="l">Стиль</th><th>Матчи</th><th>ЖК</th><th>КК</th><th>Пен.</th><th>Рейтинг</th><th></th></tr></thead>
+          <thead><tr><th>#</th><th class="l">Арбитр</th><th class="l">Город</th><th>Матчи</th><th>ЖК</th><th>КК</th><th>Пен.</th><th>Рейтинг</th><th></th></tr></thead>
           <tbody>
             ${refs.map((r, i) => `<tr>
               <td><b>${i + 1}</b></td>
               <td class="l"><b>${e(r.name)}</b>${r.varRole ? ` <span class="tag">${e(r.varRole)}</span>` : ''}</td>
               <td class="l">${e(r.city)}</td>
-              <td class="l"><span class="tag">${e(styleNames[r.style] || r.style)}</span></td>
               <td>${r.matches || 0}</td>
               <td>${r.yellows || 0}</td>
               <td>${r.reds || 0}</td>
@@ -2358,7 +2351,7 @@ async function pgAdmin(app) {
       const r = await act(() => api('/admin/referee', {
         name: $('#rf_name').value,
         city: $('#rf_city').value,
-        style: $('#rf_style').value,
+        styleDesc: $('#rf_styleDesc').value,
         rating: 0,
         leagues: $('#rf_leagues').value.split(',').map(s => s.trim()).filter(Boolean)
       }), 'Судья добавлен');
@@ -2376,7 +2369,6 @@ async function pgAdmin(app) {
       if (!r) return;
       const m = modal(`<h3>Портфолио арбитра: ${e(r.name)}</h3>
         <p><b>Город:</b> ${e(r.city)} · <b>Возраст:</b> ${r.age || 40} лет · <b>Рейтинг (по симуляции):</b> ${Number(r.rating).toFixed(1)}</p>
-        <p><b>Стиль судейства:</b> ${e(r.styleDesc || styleNames[r.style] || r.style)}</p>
         <p><b>Доступные лиги:</b> ${(r.leagues || []).join(', ').toUpperCase()}</p>
         <p><b>Статистика в симуляторе:</b> Матчи: ${r.matches} · ЖК: ${r.yellows} · КК: ${r.reds} · Пенальти: ${r.penalties}</p>
         <p id="rf_bio_txt" class="muted" style="white-space:pre-line">${e(r.bio || '')}</p>
@@ -2604,7 +2596,7 @@ async function pgAdmin(app) {
     const s = ov.settings, k = ov.keys, mo = ov.models || {};
     ab.innerHTML = `<div class="panel"><h3>Код администратора</h3><div class="code">${e(s.adminCode)}</div><p class="muted small">Его можно переопределить переменной окружения ADMIN_CODE.</p></div>
     <div class="panel"><h3>Нейросеть</h3><p class="muted small">Порядок: Gemini → Groq → OpenRouter. Если у одного закончился лимит, запрос уходит к следующему. Ключи можно задать здесь или переменными окружения.</p>
-    ${[['gemini', 'Google Gemini (AI Studio)', 'gemini-2.5-flash'], ['groq', 'Groq', 'openai/gpt-oss-120b'], ['openrouter', 'OpenRouter', 'openrouter/free']].map(([n, t, d]) => `<div class="row" style="margin-top:8px"><div style="flex:1;min-width:230px"><label>${t} ${k[n] ? '<span class="tag">ключ есть</span>' : ''}</label><input id="k_${n}" type="password" placeholder="${k[n] ? 'оставьте пустым, чтобы не менять' : 'вставьте ключ'}" autocomplete="off"></div><div style="flex:1;min-width:200px"><label>Модель</label><input id="m_${n}" value="${e(mo[n] || '')}" placeholder="${d}"></div></div>`).join('')}
+    ${[['gemini', 'Google Gemini (AI Studio)', 'gemini-3.8-flash'], ['groq', 'Groq', 'openai/gpt-oss-120b'], ['openrouter', 'OpenRouter', 'openrouter/free']].map(([n, t, d]) => `<div class="row" style="margin-top:8px"><div style="flex:1;min-width:230px"><label>${t} ${k[n] ? '<span class="tag">ключ есть</span>' : ''}</label><input id="k_${n}" type="password" placeholder="${k[n] ? 'оставьте пустым, чтобы не менять' : 'вставьте ключ'}" autocomplete="off"></div><div style="flex:1;min-width:200px"><label>Модель</label><input id="m_${n}" value="${e(mo[n] || '')}" placeholder="${d}"></div></div>`).join('')}
     <label style="margin-top:10px"><input type="checkbox" id="gr" ${s.grounding ? 'checked' : ''} style="width:auto"> Поиск Google при создании карточек (только Gemini)</label></div>
     <div class="panel"><h3>Трансляция и Telegram</h3><div class="row"><div style="flex:1;min-width:200px"><label>Секунд реального времени на минуту матча</label><input id="spm" type="number" step="0.5" value="${s.secPerMin}"></div><div style="flex:1;min-width:200px"><label>Пауза на перерыве, сек</label><input id="brk" type="number" value="${s.breakSec}"></div></div>
     <div class="row"><div style="flex:1;min-width:220px"><label>Токен Telegram-бота</label><input id="tgt" type="password" value="${e(s.tgToken)}" placeholder="123456:ABC…"></div><div style="flex:1;min-width:200px"><label>ID канала или чата</label><input id="tgc" value="${e(s.tgChat)}" placeholder="@mychannel"></div></div>
