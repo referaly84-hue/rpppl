@@ -50,10 +50,25 @@ export interface CupGroup {
   table: CupGroupTeamRow[];
 }
 
+export const CUP_FINAL_VENUE = {
+  stadium: 'БСА «Лужники» (нейтральное поле, г. Москва)',
+  city: 'Москва',
+  neutralField: true
+};
+
+export function getCupFinalVenue() {
+  return CUP_FINAL_VENUE;
+}
+
 export interface CupState2026 {
   season: string;
   stage: 'groups_and_qual' | 'playoff_spring' | 'final';
   finalDate: string; // '2027-06-06'
+  finalVenue?: {
+    stadium: string;
+    city: string;
+    neutralField: boolean;
+  };
   rplGroups: Record<string, CupGroup>; // A, B, C, D
   rplWeeks: { tue: string; wed: string; thu: string }[];
   regWeeks: { tue: string; wed: string; thu: string }[];
@@ -418,6 +433,7 @@ export function initCup2026(
     season,
     stage: 'groups_and_qual',
     finalDate: '2027-06-06',
+    finalVenue: CUP_FINAL_VENUE,
     rplGroups,
     rplWeeks: rplDates,
     regWeeks: regDates,

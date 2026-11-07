@@ -13,8 +13,13 @@ export interface ClubStyle {
 // Официальные логотипы соревнований
 export const COMPETITION_LOGOS: Record<string, string> = {
   rpl: '/logos/leagues/rpl.svg',
+  supercup: '/logos/leagues/supercup.svg',
+  'supercup-trophy': '/logos/leagues/supercup.svg',
+  'суперкубок': '/logos/leagues/supercup.svg',
+  'суперкубок россии': '/logos/leagues/supercup.svg',
   fnl: '/logos/leagues/fnl.svg',
   cup: '/logos/leagues/cup.svg',
+  playoff: '/logos/leagues/rpl.svg',
   'cup-trophy': '/logos/leagues/cup-trophy.svg',
   rfu: '/assets/aistudio/russia_russian-football-union.football-logos.cc_21f191ca.svg',
   '2la': '/logos/leagues/2la.svg',
@@ -26,12 +31,16 @@ export const COMPETITION_LOGOS: Record<string, string> = {
   '2lb_3': '/logos/leagues/2lb.svg',
   '2lb_4': '/logos/leagues/2lb.svg',
   media: '/logos/leagues/media.svg',
-  russia: '/assets/aistudio/russia_russia-national-team.football-logos.cc_3677ab12.svg'
+  russia: '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+  national: '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+  'сборная': '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+  'сборная россии': '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg'
 };
 
 export function getCompetitionLogo(compId: string): string {
   const clean = (compId || '').toLowerCase().trim();
   if (COMPETITION_LOGOS[clean]) return COMPETITION_LOGOS[clean];
+  if (clean.includes('supercup') || clean.includes('суперкубок')) return COMPETITION_LOGOS.supercup;
   if (clean.startsWith('2la')) return COMPETITION_LOGOS['2la'];
   if (clean.startsWith('2lb')) return COMPETITION_LOGOS['2lb'];
   return COMPETITION_LOGOS.rpl;
@@ -215,7 +224,12 @@ export const OFFICIAL_LOGOS: Record<string, string> = {
   'фк эгриси': '/assets/aistudio/f14322dd6495d94f39ec68f33cf52_b5ba6e96.webp',
   'чисто питер': '/assets/aistudio/original__3__dab66e2c.png',
   'rocket team': '/assets/aistudio/1713523892825857620_cf3b7ed4.png',
-  'рокет тим': '/assets/aistudio/1713523892825857620_cf3b7ed4.png'
+  'рокет тим': '/assets/aistudio/1713523892825857620_cf3b7ed4.png',
+  'сборная россии': '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+  'сборная': '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+  'россия': '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+  'сборная рф': '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+  'национальная сборная': '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg'
 };
 
 // Фирменные цвета клубов
@@ -337,7 +351,10 @@ export const OFFICIAL_COLORS: Record<string, { primary: string; secondary: strin
   'эгриси': { primary: '#ffcc00', secondary: '#111111', short: 'ЭГР' },
   'чисто питер': { primary: '#002b66', secondary: '#ffffff', short: 'ЧСП' },
   'rocket team': { primary: '#111111', secondary: '#ffffff', short: 'RKT' },
-  'рокет тим': { primary: '#111111', secondary: '#ffffff', short: 'RKT' }
+  'рокет тим': { primary: '#111111', secondary: '#ffffff', short: 'RKT' },
+  'сборная россии': { primary: '#b91c1c', secondary: '#ffffff', short: 'РОС' },
+  'сборная': { primary: '#b91c1c', secondary: '#ffffff', short: 'РОС' },
+  'россия': { primary: '#b91c1c', secondary: '#ffffff', short: 'РОС' }
 };
 
 // Вспомогательная функция кодирования SVG в Data URI
