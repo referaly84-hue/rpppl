@@ -120,8 +120,8 @@ test('satellite and reserve clubs resolve to parent club official crests', () =>
   assert.ok(getTeamLogo('Крылья Советов-2').includes('russia_krylya'));
 });
 
-test('competition logos dictionary contains RPL, FNL, Cup, 2LA, 2LB, and Media League emblems', () => {
-  const comps = ['rpl', 'fnl', 'cup', '2la', '2lb', 'media'];
+test('competition logos dictionary contains RPL, Supercup, FNL, Cup, 2LA, 2LB, and Media League emblems', () => {
+  const comps = ['rpl', 'supercup', 'fnl', 'cup', '2la', '2lb', 'media'];
   for (const c of comps) {
     assert.ok(COMPETITION_LOGOS[c], `Competition ${c} must have an emblem`);
     const diskPath = path.join(process.cwd(), 'public', COMPETITION_LOGOS[c].replace(/^\//, ''));
@@ -199,5 +199,14 @@ test('official league transition regulations and table zones match reform specif
 
   // 2LB: 1 top (выход в Серебро)
   assert.equal(getTeamZoneClass('2lb_1', 1, 16).zoneClass, 'zone-top');
+});
+
+test('Russian national team resolves to uploaded official SVG crest', () => {
+  const rusLogo = getTeamLogo('Сборная России');
+  assert.equal(rusLogo, '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg');
+  const diskPath = path.join(process.cwd(), 'public', rusLogo.replace(/^\//, ''));
+  assert.ok(fs.existsSync(diskPath), `Official file ${diskPath} must exist on disk`);
+  const content = fs.readFileSync(diskPath, 'utf8');
+  assert.ok(content.includes('<svg'), 'Official logo must be valid SVG');
 });
 

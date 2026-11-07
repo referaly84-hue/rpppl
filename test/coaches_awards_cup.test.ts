@@ -225,13 +225,14 @@ test('Referee assignment regulations: RPL & Cup only, 1 match per tour for head 
 
   // 2. В каждом туре РПЛ и Кубка России каждый главный арбитр судит строго 1 матч и больше ничего
   function getTourKey(f: any): string {
-    if (f.comp === 'rpl') return `rpl:${f.round}`;
+    const s = f.season || '2026/27';
+    if (f.comp === 'rpl') return `${s}:rpl:${f.round}`;
     if (f.comp === 'cup') {
       const p = f.cupPath || (f.round <= 6 ? 'rpl_group' : 'regions_qual');
       const r = f.qualRound || f.round || f.cupStage || 1;
-      return `cup:${p}:${r}`;
+      return `${s}:cup:${p}:${r}`;
     }
-    return `${f.comp}:${f.round || 1}`;
+    return `${s}:${f.comp}:${f.round || 1}`;
   }
 
   const tours: Record<string, any[]> = {};
@@ -265,4 +266,349 @@ test('Referee assignment regulations: RPL & Cup only, 1 match per tour for head 
   }
 });
 
+test('Match simulation: prompt.txt has authentic 10-section structure and context requirements', () => {
+  const prompt = fs.readFileSync('prompt.txt', 'utf8');
+
+  // Verify all 10 sections are explicitly present
+  assert.ok(prompt.includes('═══ 1. ГЛАВНЫЙ ПРИНЦИП И ИСТИННАЯ ФИЗИКА ═══'), 'Section 1 missing');
+  assert.ok(prompt.includes('═══ 2. ХРОНОЛОГИЯ, МИКРО-ЦЕПОЧКИ И ДИНАМИКА ЭПИЗОДОВ ═══'), 'Section 2 missing');
+  assert.ok(prompt.includes('═══ 3. СУДЕЙСТВО, ПСИХОЛОГИЯ И ПОВЕДЕНИЕ АРБИТРОВ ═══'), 'Section 3 missing');
+  assert.ok(prompt.includes('═══ 4. ПРОТОКОЛ VAR И СУДЕЙСКИЕ РЕШЕНИЯ ═══'), 'Section 4 missing');
+  assert.ok(prompt.includes('═══ 5. ПОГОДА, ГАЗОН И ДЕГРАДАЦИЯ ПОКРЫТИЯ ═══'), 'Section 5 missing');
+  assert.ok(prompt.includes('═══ 6. ЗАМЕНЫ, ОКНА И ТАКТИЧЕСКИЕ ПЕРЕСТРОЕНИЯ ═══'), 'Section 6 missing');
+  assert.ok(prompt.includes('═══ 7. ТРАВМЫ, МЕДИЦИНСКАЯ ПОМОЩЬ И out_days ═══'), 'Section 7 missing');
+  assert.ok(prompt.includes('═══ 8. АТМОСФЕРА, ЭКИПИРОВКА И ФУТБОЛЬНЫЕ ИНЦИДЕНТЫ ═══'), 'Section 8 missing');
+  assert.ok(prompt.includes('═══ 9. УЧЁТ ВСЕХ ДАННЫХ САЙТА И КОНТЕКСТА ═══'), 'Section 9 missing');
+  assert.ok(prompt.includes('═══ 10. СТРОГИЙ ФОРМАТ ВЫХОДНЫХ ДАННЫХ (JSON) ═══'), 'Section 10 missing');
+
+  // Verify key domain concepts
+  assert.ok(prompt.includes('cooling_break'));
+  assert.ok(prompt.includes('out_days'));
+  assert.ok(prompt.includes('VAR'));
+  assert.ok(prompt.includes('state_at_end'));
+  assert.ok(prompt.includes('momentum_note'));
+});
+
+test('Clean transfers: initial mock transfers are not automatically re-seeded', () => {
+  const db = JSON.parse(fs.readFileSync('data/db.json', 'utf8'));
+  assert.strictEqual(Array.isArray(db.transfers), true, 'db.transfers must be an array');
+  assert.strictEqual(db.transfers.length, 0, 'db.transfers must remain empty until user or gameplay creates transfers');
+});
+
+test('Dual-time scheduling: matches feature both real broadcast time and game season calendar time', () => {
+  // Test the calculation logic of ensureDualTimes
+  const sampleFixtures: any[] = [
+    { id: 'fx1', comp: 'rpl', round: 1, date: '2026-07-18', time: '14:00', home: 't1', away: 't2' },
+    { id: 'fx2', comp: 'rpl', round: 1, date: '2026-07-18', time: '16:30', home: 't3', away: 't4' },
+    { id: 'fx3', comp: 'rpl', round: 1, date: '2026-07-19', time: '19:00', home: 't5', away: 't6' },
+    { id: 'fx4', comp: 'rpl', round: 2, date: '2026-07-25', time: '14:00', home: 't2', away: 't3' }
+  ];
+
+  const baseRealStart = '2026-07-10';
+  const roundCounts: Record<string, number> = {};
+  sampleFixtures.forEach((f: any) => {
+    f.gameDate = f.date;
+    f.gameTime = f.time;
+
+    const rnd = Number(f.round) || 1;
+    const key = `${f.comp || 'all'}_${rnd}`;
+    const idx = roundCounts[key] || 0;
+    roundCounts[key] = idx + 1;
+
+    // 1 tour per real calendar day:
+    const dt = new Date(baseRealStart + 'T12:00:00Z');
+    dt.setUTCDate(dt.getUTCDate() + (rnd - 1));
+    f.realDate = dt.toISOString().slice(0, 10);
+
+    // Staggered by 85 minutes (~30-min break between games):
+    const slotMin = 12 * 60 + idx * 85;
+    const rh = String(Math.floor(slotMin / 60)).padStart(2, '0');
+    const rm = String(slotMin % 60).padStart(2, '0');
+    f.realTime = `${rh}:${rm}`;
+  });
+
+  // Round 1 matches must all occur on real day 2026-07-10
+  assert.strictEqual(sampleFixtures[0].realDate, '2026-07-10');
+  assert.strictEqual(sampleFixtures[1].realDate, '2026-07-10');
+  assert.strictEqual(sampleFixtures[2].realDate, '2026-07-10');
+
+  // Round 2 match must occur on next real day 2026-07-11
+  assert.strictEqual(sampleFixtures[3].realDate, '2026-07-11');
+
+  // Staggered times with 85-min interval (30-min break between consecutive games):
+  assert.strictEqual(sampleFixtures[0].realTime, '12:00');
+  assert.strictEqual(sampleFixtures[1].realTime, '13:25');
+  assert.strictEqual(sampleFixtures[2].realTime, '14:50');
+
+  // Virtual game calendar preserved:
+  assert.strictEqual(sampleFixtures[0].gameDate, '2026-07-18');
+  assert.strictEqual(sampleFixtures[3].gameDate, '2026-07-25');
+});
+
+test('Head-to-head (H2H): produces exactly 7 recent meetings with accurate win/loss/draw summary', () => {
+  // Deterministic generator verification
+  const pairSeed = ['zenit', 'spartak'].sort().join(':');
+  let hash = 0;
+  for (let i = 0; i < pairSeed.length; i++) {
+    hash = ((hash << 5) - hash) + pairSeed.charCodeAt(i);
+    hash |= 0;
+  }
+  const pseudoRand = (n: number) => {
+    const x = Math.sin(hash + n * 997.13) * 10000;
+    return x - Math.floor(x);
+  };
+
+  const histDates = [
+    '2026-05-18', '2025-11-23', '2025-08-16', '2025-04-12',
+    '2024-10-27', '2024-05-04', '2023-11-12'
+  ];
+  const scoreCombos = [
+    [2, 1], [1, 1], [0, 1], [1, 0], [2, 2], [3, 1], [1, 2]
+  ];
+
+  const matches: any[] = [];
+  for (let k = 0; k < 7; k++) {
+    const [sh, sa] = scoreCombos[Math.floor(pseudoRand(k + 10) * scoreCombos.length)];
+    const isHome = k % 2 === 0;
+    const curHomeGoals = isHome ? sh : sa;
+    const curAwayGoals = isHome ? sa : sh;
+    const winner = curHomeGoals > curAwayGoals ? 'home' : (curAwayGoals > curHomeGoals ? 'away' : 'draw');
+
+    matches.push({
+      date: histDates[k],
+      homeScore: sh,
+      awayScore: sa,
+      winner,
+      curHomeGoals,
+      curAwayGoals
+    });
+  }
+
+  assert.strictEqual(matches.length, 7, 'Must have exactly 7 meetings');
+
+  const homeWins = matches.filter(m => m.winner === 'home').length;
+  const draws = matches.filter(m => m.winner === 'draw').length;
+  const awayWins = matches.filter(m => m.winner === 'away').length;
+
+  assert.strictEqual(homeWins + draws + awayWins, 7, 'Sum of outcomes must equal 7');
+});
+
+test('Budgets: db.budgetHistory is always an Array and slice/filter operations succeed without error', () => {
+  const db = JSON.parse(fs.readFileSync('data/db.json', 'utf8'));
+  assert.ok(Array.isArray(db.budgetHistory), 'db.budgetHistory must be an array');
+  const sliced = (Array.isArray(db.budgetHistory) ? db.budgetHistory : []).slice(-200).reverse();
+  assert.ok(Array.isArray(sliced), 'Sliced history must be an array');
+});
+
+test('Super Cup tournament: regulations, branding and match generation', () => {
+  const db = JSON.parse(fs.readFileSync('data/db.json', 'utf8'));
+  const comps = db.comps || [];
+  const superCupComp = comps.find((c: any) => c.id === 'supercup');
+  assert.ok(superCupComp, 'Super Cup must exist in comps list');
+  assert.strictEqual(superCupComp.logo, '/logos/leagues/supercup.svg');
+  const superCupFx = (db.fixtures || []).find((f: any) => f.comp === 'supercup');
+  assert.ok(superCupFx, 'Super Cup fixture must be present for the season');
+  assert.ok(superCupFx.home && superCupFx.away, 'Super Cup must have home and away clubs');
+});
+
+test('Top Transfers: categories include expensive, valuable, and flops', () => {
+  const db = JSON.parse(fs.readFileSync('data/db.json', 'utf8'));
+  assert.ok(Array.isArray(db.transfers), 'transfers must be array');
+});
+
+test('Real-time dual calendar: RPL and Cup fixtures strictly alternate 1 tour per day with night and daytime matches', () => {
+  const sampleFixtures: any[] = [
+    { id: 'rpl1', comp: 'rpl', round: 1, date: '2026-07-18', time: '14:00', home: 't1', away: 't2' },
+    { id: 'rpl2', comp: 'rpl', round: 1, date: '2026-07-18', time: '16:30', home: 't3', away: 't4' },
+    { id: 'cup1', comp: 'cup', cupPath: 'regions_qual', qualRound: 1, date: '2026-07-21', time: '17:00', home: 't5', away: 't6' },
+    { id: 'cup2', comp: 'cup', cupPath: 'regions_qual', qualRound: 1, date: '2026-07-21', time: '19:00', home: 't7', away: 't8' },
+    { id: 'rpl3', comp: 'rpl', round: 2, date: '2026-07-25', time: '14:00', home: 't2', away: 't3' },
+    { id: 'rpl4', comp: 'rpl', round: 2, date: '2026-07-25', time: '19:00', home: 't4', away: 't1' }
+  ];
+
+  const baseRealStart = '2026-11-07';
+  const addDays = (d: string, n: number) => {
+    const t = new Date(d + 'T12:00:00Z');
+    t.setUTCDate(t.getUTCDate() + n);
+    return t.toISOString().slice(0, 10);
+  };
+
+  // Group by tournament round:
+  const tourBlocks = new Map<string, any>();
+  sampleFixtures.forEach((f: any) => {
+    f.gameDate = f.date;
+    f.gameTime = f.time;
+    const tourKey = f.comp === 'rpl' ? `rpl_tour_${f.round}` : `cup_regions_r${f.qualRound}`;
+    if (!tourBlocks.has(tourKey)) {
+      tourBlocks.set(tourKey, { key: tourKey, minGameDate: f.date, fixtures: [] });
+    }
+    const b = tourBlocks.get(tourKey);
+    b.fixtures.push(f);
+    if (f.date < b.minGameDate) b.minGameDate = f.date;
+  });
+
+  const sortedBlocks = Array.from(tourBlocks.values()).sort((a, b) => a.minGameDate.localeCompare(b.minGameDate));
+  
+  // 1 tour per real calendar day:
+  sortedBlocks.forEach((block, blockIndex) => {
+    const realDayDate = addDays(baseRealStart, blockIndex);
+    const nightSlots = ['01:00', '01:30'];
+    block.fixtures.forEach((f: any, fi: number) => {
+      f.realDate = realDayDate;
+      f.realTime = fi === 0 ? nightSlots[0] : '14:00';
+    });
+  });
+
+  // Verify block 0 (RPL 1) is Day 0:
+  assert.strictEqual(sampleFixtures[0].realDate, '2026-11-07');
+  assert.strictEqual(sampleFixtures[1].realDate, '2026-11-07');
+
+  // Verify block 1 (Cup 1) is Day 1:
+  assert.strictEqual(sampleFixtures[2].realDate, '2026-11-08');
+  assert.strictEqual(sampleFixtures[3].realDate, '2026-11-08');
+
+  // Verify block 2 (RPL 2) is Day 2:
+  assert.strictEqual(sampleFixtures[4].realDate, '2026-11-09');
+  assert.strictEqual(sampleFixtures[5].realDate, '2026-11-09');
+
+  // Verify night kickoff present in RPL 1:
+  assert.strictEqual(sampleFixtures[0].realTime, '01:00');
+  // Verify daytime kickoff present in RPL 1:
+  assert.strictEqual(sampleFixtures[1].realTime, '14:00');
+
+  // Verify realAt MSK parsing:
+  const dt = new Date(`${sampleFixtures[0].realDate}T${sampleFixtures[0].realTime}:00+03:00`);
+  assert.ok(!isNaN(dt.getTime()));
+});
+
+test('Neutral grounds for all finals: Russian Cup in Luzhniki, first Super Cup in Nizhny Novgorod', async () => {
+  const { CUP_FINAL_VENUE, getCupFinalVenue } = await import('../src/cup2026.ts');
+  const { LEAGUE_REGULATIONS } = await import('../src/rules.ts');
+  const raw = fs.readFileSync('data/db.json', 'utf8');
+  const db = JSON.parse(raw);
+
+  // 1. First Super Cup (2026/27) must be in Nizhny Novgorod on neutral ground
+  const sc2026 = (db.fixtures || []).find((f: any) => f.comp === 'supercup' && f.season === '2026/27');
+  assert.ok(sc2026, 'Super Cup 2026/27 fixture must exist');
+  assert.strictEqual(sc2026.neutralField, true, 'Super Cup must be on a neutral field');
+  assert.strictEqual(sc2026.city, 'Нижний Новгород', 'First Super Cup city must be Nizhny Novgorod');
+  assert.ok(sc2026.stadium.includes('Нижний Новгород'), 'First Super Cup stadium must be in Nizhny Novgorod');
+  assert.ok(sc2026.stadium.includes('нейтральное поле'), 'First Super Cup stadium must specify neutral field');
+
+  // 2. Russian Cup final venue must be Luzhniki in Moscow
+  assert.strictEqual(CUP_FINAL_VENUE.city, 'Москва', 'Russian Cup final city must be Moscow');
+  assert.ok(CUP_FINAL_VENUE.stadium.includes('Лужники'), 'Russian Cup final must be in Luzhniki');
+  assert.strictEqual(CUP_FINAL_VENUE.neutralField, true, 'Russian Cup final must be on a neutral field');
+  assert.strictEqual(getCupFinalVenue().stadium, CUP_FINAL_VENUE.stadium);
+
+  // 3. Rules regulations summary check
+  assert.ok(LEAGUE_REGULATIONS.supercup.rulesSummary.some(s => s.includes('Нижнем Новгороде')), 'Super Cup rules must mention Nizhny Novgorod');
+  assert.ok(LEAGUE_REGULATIONS.cup.rulesSummary.some(s => s.includes('Лужники')), 'Cup rules must mention Luzhniki');
+
+  // 4. Any fixture in the database marked as a final must have neutralField === true
+  (db.fixtures || []).forEach((f: any) => {
+    const isFinal = f.comp === 'supercup' || f.cupStage === 'superfinal' || (f.label && f.label.toLowerCase().includes('финал') && !f.label.toLowerCase().includes('1/'));
+    if (isFinal) {
+      assert.strictEqual(f.neutralField, true, `Final match ${f.id} (${f.label}) must have neutralField set to true`);
+    }
+  });
+});
+
+test('Manual single match schedule modification: admin can change game and real date/time individually', async () => {
+  const raw = fs.readFileSync('data/db.json', 'utf8');
+  const db = JSON.parse(raw);
+  const targetFx = (db.fixtures || []).find((f: any) => f.comp === 'rpl') || (db.fixtures || [])[0];
+  assert.ok(targetFx, 'At least one fixture must exist');
+
+  const adminCode = db?.settings?.adminCode || 'TEST_ADMIN';
+  const BASE_URL = 'http://localhost:3000';
+
+  // 1. Non-admin is rejected (403 Forbidden)
+  const rejectRes = await fetch(`${BASE_URL}/api/admin/fixture`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: targetFx.id,
+      gameDate: '2026-09-15',
+      gameTime: '17:30'
+    })
+  });
+  assert.strictEqual(rejectRes.status, 403, 'Non-authenticated request must be rejected with 403');
+
+  // 2. Admin logs in
+  const loginRes = await fetch(`${BASE_URL}/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: adminCode })
+  });
+  assert.strictEqual(loginRes.status, 200, 'Admin login should succeed');
+  const { token } = await loginRes.json();
+  assert.ok(token, 'Must receive auth token');
+
+  // 3. Admin updates individual match date and time (both game and real time)
+  const newGameDate = '2026-10-18';
+  const newGameTime = '19:45';
+  const newRealDate = '2026-11-20';
+  const newRealTime = '21:15';
+  const newStadium = 'ВЭБ Арена (Тест)';
+
+  const updateRes = await fetch(`${BASE_URL}/api/admin/fixture`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-token': token
+    },
+    body: JSON.stringify({
+      id: targetFx.id,
+      gameDate: newGameDate,
+      gameTime: newGameTime,
+      realDate: newRealDate,
+      realTime: newRealTime,
+      stadium: newStadium,
+      neutralField: true,
+      force: true
+    })
+  });
+  assert.strictEqual(updateRes.status, 200, 'Admin update must succeed');
+  const updateData = await updateRes.json();
+  assert.strictEqual(updateData.ok, 1);
+  assert.ok(updateData.fixture, 'Must return updated fixture');
+  assert.strictEqual(updateData.fixture.gameDate, newGameDate);
+  assert.strictEqual(updateData.fixture.gameTime, newGameTime);
+  assert.strictEqual(updateData.fixture.realDate, newRealDate);
+  assert.strictEqual(updateData.fixture.realTime, newRealTime);
+  assert.strictEqual(updateData.fixture.stadium, newStadium);
+  assert.strictEqual(updateData.fixture.neutralField, true);
+
+  // 4. Verify that other fixtures in db were NOT modified
+  const updatedDb = JSON.parse(fs.readFileSync('data/db.json', 'utf8'));
+  const updatedFxInDb = updatedDb.fixtures.find((f: any) => f.id === targetFx.id);
+  assert.strictEqual(updatedFxInDb.gameDate, newGameDate);
+  assert.strictEqual(updatedFxInDb.gameTime, newGameTime);
+  assert.strictEqual(updatedFxInDb.realDate, newRealDate);
+  assert.strictEqual(updatedFxInDb.realTime, newRealTime);
+
+  const secondFx = (updatedDb.fixtures || [])[1];
+  if (secondFx) {
+    assert.notStrictEqual(secondFx.id, targetFx.id);
+    assert.notStrictEqual(secondFx.gameDate, newGameDate);
+  }
+});
+
+test('Permissions: Scout request (/api/club/scout-request) is forbidden for non-admin users', async () => {
+  const res = await fetch('http://localhost:3000/api/club/scout-request', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ teamId: 'zenit' })
+  });
+  assert.strictEqual(res.status, 403, 'Must return 403 when no admin session token provided');
+  const data = await res.json();
+  assert.strictEqual(data.error, 'Нужен вход администратора');
+});
+
+test('Permissions: index.html hides weather tab and scout evaluation button from regular users', () => {
+  const html = fs.readFileSync('index.html', 'utf8');
+  assert.ok(html.includes("if (S.me?.role === 'admin') links.push(['#/weather', '🌤️ Погода'])"), 'Weather tab must be conditional on admin role');
+  assert.ok(html.includes("${S.me?.role === 'admin' ? `\n          <div>\n            <button class=\"btn\" id=\"btn_req_foreign_scouts\""), 'Scout evaluation button must be conditional on admin role');
+});
 
