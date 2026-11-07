@@ -5,12 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "start": "node server.js",
+    "start": "node server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=esm --outfile=server.js --packages=external",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test test/logos_and_rules.test.ts test/coaches_awards_cup.test.ts"
+    "test": "tsx --test test/logos_and_rules.test.ts test/coaches_awards_cup.test.ts test/playoffs_rotation.test.ts test/squads_and_weather.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

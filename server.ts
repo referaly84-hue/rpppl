@@ -11,7 +11,58 @@ import { getTeamLogo, getTeamColors, getCompetitionLogo } from './src/logos.ts';
 import { LEAGUE_REGULATIONS, getTeamZoneClass, getRplLegionLimit, isLegionnaire, getLegionnaireStatus } from './src/rules.ts';
 import { getTeamCoach, computeCoachSynergy, type Coach, STAFF_ROLES, type StaffRole, type StaffMember, generateClubStaff, getAllInitialStaff } from './src/coaches.ts';
 import { computeMatchRatings, getMatchMotm, buildTeamOfRound, buildTeamOfMonth } from './src/awards.ts';
-import { initCup2026, recalculateCupGroups, drawNextRegionsRound } from './src/cup2026.ts';
+import { GoogleGenAI } from '@google/genai';
+import { initCup2026, recalculateCupGroups, drawNextRegionsRound, CUP_FINAL_VENUE, getCupFinalVenue } from './src/cup2026.ts';
+import { CLIMATE_DATA, calculateMatchWeather, ALL_TEAMS_GEO, generateFullSquad, getOrCreateCityClimate } from './src/squads_and_weather.ts';
+import { checkForeignInterestAfterMatch, respondToForeignOffer, createForeignOfferWithAI, FOREIGN_CLUBS } from './src/foreign_transfers.ts';
+
+// ─── Gemini через прокси (одна точка) ───
+const _origFetch = globalThis.fetch;
+const GEMINI_PROXY = (process.env.GEMINI_PROXY_URL || '').trim().replace(/\/+$/, '');
+const GEMINI_SECRET = (process.env.GEMINI_PROXY_SECRET || '').trim();
+
+if (GEMINI_PROXY) {
+  globalThis.fetch = (async (input: any, init?: any) => {
+    let url = typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input?.url;
+
+    if (typeof url === 'string' && url.includes('generativelanguage.googleapis.com')) {
+      const newUrl = url.replace('https://generativelanguage.googleapis.com', GEMINI_PROXY);
+
+      if (input instanceof Request) {
+        const req = new Request(newUrl, input);
+        if (GEMINI_SECRET) req.headers.set('x-proxy-secret', GEMINI_SECRET);
+        return _origFetch(req, init); 
+      }
+
+      const newInit = { ...(init || {}) };
+      const h = new Headers(newInit.headers || {});
+      if (GEMINI_SECRET) h.set('x-proxy-secret', GEMINI_SECRET);
+      newInit.headers = h;
+      return _origFetch(newUrl, newInit);
+    }
+
+    return _origFetch(input, init);
+  }) as typeof fetch;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   ЛОКАЛЬНЫЕ НАСТРОЙКИ — впишите значения прямо сюда.
+   Используются, если ту же настройку не задали переменной окружения
+   или в админке (Настройки → Нейросеть / Telegram).
+   ВНИМАНИЕ: это секреты. Не публикуйте этот файл в открытом репозитории.
+   ═══════════════════════════════════════════════════════════════════ */
+const HARDCODED = {
+  geminiKeys: [''] as string[],      // до 10 ключей из РАЗНЫХ проектов Google, например ['AIza...', 'AIza...']
+  geminiModel: 'gemini-3.5-flash-lite',                 // пусто = gemini-3.8-flash
+  tgToken: '',                     // токен бота Telegram, например '123456:ABC...'
+  tgChat: 'https://t.me/matchsmotr'                       // канал: '@my_channel' или числовой id '-1001234567890'
+};
+const tgToken = () => String(db.settings.tgToken || HARDCODED.tgToken || '').trim();
+const tgChat = () => String(db.settings.tgChat || HARDCODED.tgChat || '').trim();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,6 +88,50 @@ const mkCode = () => {
   for (let i = 0; i < 8; i++) s += a[crypto.randomInt(a.length)];
   return s.slice(0, 4) + '-' + s.slice(4);
 };
+/* ───────── постоянные коды входа клубов ─────────
+   Единый реестр club_codes.json: название клуба -> код. Хранится отдельно от db.json,
+   поэтому коды не меняются при пересоздании базы, пересидировании и переименовании. */
+const CODES_FILE = process.env.CODES_FILE || path.join(__dirname, 'club_codes.json');
+const codeKey = (s: any) => String(s || '').toUpperCase().replace(/[\s\-_]/g, '');
+let codeReg: { admin?: string; clubs: Record<string, string> } = { clubs: {} };
+function loadCodeRegistry() {
+  try {
+    const j = JSON.parse(fs.readFileSync(CODES_FILE, 'utf8'));
+    codeReg = { admin: j.admin, clubs: (j.clubs && typeof j.clubs === 'object') ? j.clubs : {} };
+  } catch { codeReg = { clubs: {} }; }
+}
+function saveCodeRegistry() {
+  try {
+    fs.writeFileSync(CODES_FILE + '.tmp', JSON.stringify(codeReg, null, 2));
+    fs.renameSync(CODES_FILE + '.tmp', CODES_FILE);
+  } catch (e: any) { console.error('codes save:', e.message); }
+}
+/** Гарантирует, что у КАЖДОЙ команды (любая лига) есть уникальный постоянный код. Идемпотентно. */
+function ensureTeamCodes() {
+  if (!db || !Array.isArray(db.teams)) return;
+  const byNorm = new Map<string, string>();
+  for (const [name, c] of Object.entries(codeReg.clubs)) byNorm.set(norm(name), c);
+  const used = new Set<string>(Object.values(codeReg.clubs).map(codeKey));
+  if (codeReg.admin) used.add(codeKey(codeReg.admin));
+  let dirty = false;
+  for (const t of db.teams) {
+    const k = norm(t.name);
+    let c = byNorm.get(k);
+    if (!c) {
+      c = t.code && !used.has(codeKey(t.code)) ? t.code : '';
+      while (!c || used.has(codeKey(c))) c = mkCode();
+      codeReg.clubs[t.name] = c;
+      byNorm.set(k, c);
+      used.add(codeKey(c));
+      dirty = true;
+    }
+    t.code = c;
+  }
+  const envAdmin = process.env.ADMIN_CODE;
+  if (!codeReg.admin) { codeReg.admin = db.settings?.adminCode || mkCode(); dirty = true; }
+  if (db.settings && !envAdmin) db.settings.adminCode = codeReg.admin;
+  if (dirty) saveCodeRegistry();
+}
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const norm = (s: any) => String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim();
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -156,7 +251,9 @@ const LOWER: Record<string, string[]> = {
 
 const COMPS = [
   { id: 'rpl', name: 'РПЛ', type: 'league', tier: 1, level: '1-й уровень (16 команд)', logo: '/logos/leagues/rpl.svg' },
+  { id: 'supercup', name: 'Суперкубок России', type: 'cup', level: 'Суперкубок · Матч за трофей', logo: '/logos/leagues/supercup.svg' },
   { id: 'cup', name: 'Кубок России', type: 'cup', level: 'Национальный кубок', logo: '/logos/leagues/cup.svg' },
+  { id: 'playoff', name: 'Стыковые матчи', type: 'cup', tier: 1, level: 'Переходные стыки лиг', logo: '/logos/leagues/rpl.svg' },
   { id: 'fnl', name: 'Первая лига', type: 'league', tier: 2, level: '2-й уровень (18 команд)', logo: '/logos/leagues/fnl.svg' },
   { id: '2la_gold', name: 'Вторая лига А · Золото', type: 'league', tier: 3, cat: '2la', level: '3-й уровень (10 команд)', logo: '/logos/leagues/2la.svg' },
   { id: '2la_silver', name: 'Вторая лига А · Серебро', type: 'league', tier: 3, cat: '2la', level: '3-й уровень (10 команд)', logo: '/logos/leagues/2la.svg' },
@@ -216,7 +313,8 @@ function seed() {
     transfers: [],
     sessions: {},
     llmlog: [],
-    cup: null
+    cup: null,
+    budgetHistory: []
   };
   for (const [name, city, lat, lon, stadium] of RPL) {
     d.teams.push({ id: uid(), name, comp: 'rpl', city, lat, lon, stadium, code: mkCode(), logo: getTeamLogo(name, null, 'rpl') });
@@ -451,13 +549,14 @@ function isInInternationalBreak(dateStr: string): boolean {
 }
 
 function getFixtureTourKey(f: any): string {
-  if (f.comp === 'rpl') return `rpl:${f.round}`;
+  const s = f.season || S();
+  if (f.comp === 'rpl') return `${s}:rpl:${f.round}`;
   if (f.comp === 'cup') {
     const p = f.cupPath || (f.round <= 6 ? 'rpl_group' : 'regions_qual');
     const r = f.qualRound || f.round || f.cupStage || 1;
-    return `cup:${p}:${r}`;
+    return `${s}:cup:${p}:${r}`;
   }
-  return `${f.comp}:${f.round || 1}`;
+  return `${s}:${f.comp}:${f.round || 1}`;
 }
 
 function assignTourReferees(tourList: any[]) {
@@ -591,6 +690,33 @@ function updateRefereeStats(f: any, events: any[] = []) {
   }
 }
 
+function assignFixtureWeather(f: any) {
+  if (!f) return f;
+  const homeTeam = (db?.teams || []).find((t: any) => t.id === f.home);
+  const matchCity = f.city || homeTeam?.city || 'Москва';
+  const matchDate = f.gameDate || f.date || '2026-09-15';
+  const matchTime = f.gameTime || f.time || '17:00';
+  const w = calculateMatchWeather(matchCity, matchDate, matchTime);
+  f.weather = w.text;
+  f.weatherShort = w.short;
+  f.weatherDetails = {
+    temp: w.temp,
+    feelsLike: w.feelsLike,
+    condition: w.condition,
+    icon: w.icon,
+    wind: w.wind,
+    windDir: w.windDir,
+    humidity: w.humidity,
+    pressure: w.pressure,
+    precipitation: w.precipitation,
+    pitch: w.pitch
+  };
+  if (db?.dailyWeather) {
+    db.dailyWeather[`${matchCity}_${matchDate}`] = w;
+  }
+  return f;
+}
+
 let db: any;
 function load() {
   try {
@@ -602,8 +728,8 @@ function load() {
   for (const k of Object.keys(def.settings)) {
     if (db.settings[k] === undefined) db.settings[k] = def.settings[k];
   }
-  for (const k of ['comps', 'teams', 'players', 'fixtures', 'derbies', 'transfers', 'llmlog', 'tournaments', 'transferRequests']) {
-    if (!db[k]) db[k] = [];
+  for (const k of ['comps', 'teams', 'players', 'fixtures', 'derbies', 'transfers', 'llmlog', 'tournaments', 'transferRequests', 'budgetHistory']) {
+    if (!Array.isArray(db[k])) db[k] = [];
   }
   if (!db.referees || db.referees.length < 26) db.referees = JSON.parse(JSON.stringify(DEFAULT_REFEREES));
   if (!db.assistants || !db.assistants.length) {
@@ -626,6 +752,33 @@ function load() {
   }
   for (const k of ['squads', 'lineups', 'tactics', 'sessions']) {
     if (!db[k]) db[k] = {};
+  }
+  if (!db.cityClimates || !Object.keys(db.cityClimates).length) {
+    db.cityClimates = CLIMATE_DATA;
+  }
+  if (!db.dailyWeather) db.dailyWeather = {};
+
+  // Синхронизируем географию команд для всех лиг
+  for (const t of (db.teams || [])) {
+    const geo = ALL_TEAMS_GEO[t.name];
+    if (geo) {
+      if (!t.city) t.city = geo.city;
+      if (!t.stadium) t.stadium = geo.stadium;
+      if (t.lat == null) t.lat = geo.lat;
+      if (t.lon == null) t.lon = geo.lon;
+    } else if (!t.city) {
+      t.city = 'Москва';
+      t.lat = 55.75;
+      t.lon = 37.62;
+    }
+  }
+  if (!db.foreignOffers) db.foreignOffers = [];
+
+  // Привязываем погоду ко всем матчам
+  for (const f of (db.fixtures || [])) {
+    if (!f.weather) {
+      assignFixtureWeather(f);
+    }
   }
 
   // 1. Очищаем арбитров во всех лигах, кроме РПЛ и Кубка России
@@ -726,14 +879,19 @@ function load() {
       }
     }
   }
-  if (!Array.isArray(db.coaches)) db.coaches = [];
-  const hasModernSchedule = db.fixtures.some((f: any) => f.comp === 'cup' && f.cupPath === 'regions_qual' && f.date === '2026-07-21');
-  if (!hasModernSchedule || !db.cupState2026) {
+  const hasRplSchedule = db.fixtures.some((f: any) => f.comp === 'rpl' && f.season === S());
+  if (!hasRplSchedule || !db.cupState2026) {
     genSeason('2026-07-18', S());
-  } else {
+  } else if (db.cupState2026 && db.fixtures.length) {
     recalculateCupGroups(db.cupState2026, db.fixtures);
   }
 
+  loadCodeRegistry();
+  ensureTeamCodes();
+  ensureInitialBudgets();
+  for (const s of getAvailableSeasons()) {
+    ensureSuperCupFixture(s);
+  }
   save();
 }
 
@@ -745,6 +903,11 @@ function save() {
 function saveNow() {
   saveT = null;
   try {
+    if (db && Array.isArray(db.fixtures)) {
+      for (const f of db.fixtures) {
+        if (!f.weather) assignFixtureWeather(f);
+      }
+    }
     fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db));
     fs.renameSync(DB_FILE + '.tmp', DB_FILE);
   } catch (e: any) {
@@ -801,7 +964,11 @@ function age(p: any, date: string) {
 }
 function roundLabel(f: any) {
   if (f.label) return f.label;
+  if (f.comp === 'supercup') return 'Матч за Суперкубок России';
   if (f.comp === 'cup') {
+    if (f.cupPath === 'superfinal' || f.cupStage === 'superfinal') {
+      return 'Суперфинал FONBET Кубка России';
+    }
     if (f.cupPath === 'rpl_group') {
       return `Путь РПЛ · ${f.round}-й тур`;
     }
@@ -821,6 +988,614 @@ function roundLabel(f: any) {
 }
 const compName = (f: any) => compOf(f.comp)?.name || f.comp;
 const winnerOf = (f: any) => f.hg > f.ag ? f.home : f.hg < f.ag ? f.away : (f.pen ? (f.pen.winner === 'home' ? f.home : f.away) : null);
+
+/* ───────── трансферы, топовые переходы и ИИ-советник ───────── */
+function parseFeeAmount(feeStr: any): number {
+  if (typeof feeStr === 'number') return feeStr;
+  const s = String(feeStr || '').trim();
+  const numMatch = s.match(/([0-9]+(?:[.,][0-9]+)?)/);
+  if (!numMatch) return 0;
+  let val = parseFloat(numMatch[1].replace(',', '.'));
+  if (/тыс|k|k\b/i.test(s) && !/млн|m|m\b/i.test(s)) {
+    val = val / 1000;
+  } else if (/млрд|b|b\b/i.test(s)) {
+    val = val * 1000;
+  }
+  if (/₽|руб/i.test(s)) {
+    val = val / 100;
+  }
+  return Math.round(val * 100) / 100;
+}
+
+function executeTransferIfBothApproved(t: any): boolean {
+  if (t.status === 'approved') return true;
+  const needClub = !!t.isRplToRpl;
+  const clubOk = !needClub || t.clubApproval === 'approved';
+  const adminOk = t.adminApproval === 'approved';
+
+  if (clubOk && adminOk) {
+    t.status = 'approved';
+    const p = player(t.pid);
+    if (p) {
+      if (t.from && db.squads[t.from]) {
+        db.squads[t.from] = db.squads[t.from].filter((id: string) => id !== p.id);
+      }
+      db.squads[t.to] = [...new Set([...squadOf(t.to).map((x: any) => x.id), p.id])];
+      p.teamId = t.to;
+      if (t.type === 'loan') {
+        p.loanFrom = t.from;
+        p.loanTerm = t.note || 'Аренда';
+      } else {
+        delete p.loanFrom;
+        delete p.loanTerm;
+      }
+      t.statsForNewClub = {
+        matches: p.matches || 0,
+        goals: p.goals || 0,
+        assists: p.assists || 0,
+        rating: Number(p.rating || 7.0),
+        impactScore: ((p.goals || 0) * 4 + (p.assists || 0) * 2.5 + (p.matches || 0) * 1.2 + ((p.rating || 7.0) >= 6.5 ? ((p.rating || 7.0) - 6.0) * 10 : 0)),
+        summary: `${p.goals || 0} голов, ${p.assists || 0} ассистов в ${p.matches || 0} матчах`
+      };
+
+      const feeAmt = t.feeAmount !== undefined ? t.feeAmount : parseFeeAmount(t.fee);
+      if (feeAmt && feeAmt > 0) {
+        const feeEuros = Math.round(feeAmt * 1_000_000);
+        const buyer = team(t.to);
+        const seller = team(t.from);
+        if (buyer) {
+          const prev = buyer.budget || 0;
+          buyer.budget = Math.max(0, prev - feeEuros);
+          if (!Array.isArray(db.budgetHistory)) db.budgetHistory = [];
+          db.budgetHistory.push({
+            id: uid(),
+            teamId: buyer.id,
+            teamName: buyer.name,
+            amount: -feeEuros,
+            prevBudget: prev,
+            newBudget: buyer.budget,
+            type: 'transfer_buy',
+            typeLabel: 'Покупка игрока',
+            description: `Трансфер: ${p.name} из «${seller?.name || t.fromName}» (-€${feeEuros.toLocaleString('ru-RU')})`,
+            date: new Date().toISOString(),
+            byAdmin: !!t.byAdmin
+          });
+        }
+        if (seller) {
+          const prev = seller.budget || 0;
+          seller.budget = prev + feeEuros;
+          if (!Array.isArray(db.budgetHistory)) db.budgetHistory = [];
+          db.budgetHistory.push({
+            id: uid(),
+            teamId: seller.id,
+            teamName: seller.name,
+            amount: feeEuros,
+            prevBudget: prev,
+            newBudget: seller.budget,
+            type: 'transfer_sell',
+            typeLabel: 'Продажа игрока',
+            description: `Продажа: ${p.name} в «${buyer?.name || t.toName}» (+€${feeEuros.toLocaleString('ru-RU')})`,
+            date: new Date().toISOString(),
+            byAdmin: !!t.byAdmin
+          });
+        }
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function formatTransferForPublic(t: any) {
+  const fromT = team(t.from);
+  const toT = team(t.to);
+  const p = player(t.pid);
+  const feeAmt = t.feeAmount !== undefined ? t.feeAmount : parseFeeAmount(t.fee);
+  return {
+    id: t.id,
+    pid: t.pid,
+    playerName: t.playerName || p?.name || 'Игрок',
+    pos: t.pos || p?.pos || 'ЦП',
+    from: t.from,
+    fromName: fromT?.name || t.fromName || 'Клуб',
+    fromLogo: teamLogo(t.from),
+    to: t.to,
+    toName: toT?.name || t.toName || 'Клуб',
+    toLogo: teamLogo(t.to),
+    fee: t.fee || (feeAmt ? `€${feeAmt.toFixed(1)}M` : 'Свободный агент'),
+    feeAmount: feeAmt,
+    type: t.type || 'transfer',
+    note: t.note || (t.type === 'loan' ? 'Аренда' : 'Полноценный трансфер'),
+    date: t.date || new Date().toISOString().slice(0, 10),
+    isRplToRpl: !!t.isRplToRpl,
+    stats: t.statsForNewClub || {
+      matches: p?.matches || 0,
+      goals: p?.goals || 0,
+      assists: p?.assists || 0,
+      rating: Number(p?.rating || 7.0),
+      impactScore: ((p?.goals || 0) * 4 + (p?.assists || 0) * 2.5 + (p?.matches || 0) * 1.2),
+      summary: `${p?.goals || 0} голов, ${p?.assists || 0} ассистов в ${p?.matches || 0} матчах`
+    }
+  };
+}
+
+function ensureInitialTransfers() {
+  if (!db.transfers) db.transfers = [];
+}
+
+
+/* ───────── бюджеты клубов и шкала призовых (РПЛ и Кубок) ───────── */
+const INITIAL_RPL_BUDGETS: Record<string, number> = {
+  'Зенит': 45_000_000,
+  'Спартак': 30_000_000,
+  'Динамо Москва': 18_000_000,
+  'Краснодар': 15_000_000,
+  'ЦСКА': 10_500_000,
+  'Рубин': 5_000_000,
+  'Локомотив': 3_900_000,
+  'Балтика': 3_600_000,
+  'Родина': 3_000_000,
+  'Ахмат': 3_000_000,
+  'Ростов': 3_000_000,
+  'Акрон': 2_500_000,
+  'Крылья Советов': 2_000_000,
+  'Оренбург': 2_000_000,
+  'Динамо Махачкала': 1_700_000,
+  'Факел': 1_200_000
+};
+
+const RPL_PRIZE_SCALE = [
+  { place: 1, prize: 13_000_000, label: '1 место — Чемпион РПЛ' },
+  { place: 2, prize: 11_800_000, label: '2 место — Серебряный призёр' },
+  { place: 3, prize: 10_000_000, label: '3 место — Бронзовый призёр' },
+  { place: 4, prize: 9_000_000, label: '4 место' },
+  { place: 5, prize: 8_000_000, label: '5 место' },
+  { place: 6, prize: 7_000_000, label: '6 место' },
+  { place: 7, prize: 6_200_000, label: '7 место' },
+  { place: 8, prize: 5_500_000, label: '8 место' },
+  { place: 9, prize: 4_900_000, label: '9 место' },
+  { place: 10, prize: 4_400_000, label: '10 место' },
+  { place: 11, prize: 4_100_000, label: '11 место' },
+  { place: 12, prize: 3_900_000, label: '12 место' },
+  { place: 13, prize: 3_700_000, label: '13 место (Стыки)' },
+  { place: 14, prize: 3_600_000, label: '14 место (Стыки)' },
+  { place: 15, prize: 3_500_000, label: '15 место (Вылет)' },
+  { place: 16, prize: 3_400_000, label: '16 место (Вылет)' }
+];
+
+const CUP_PRIZE_SCALE = {
+  groupParticipation: 300_000, // 300 тысяч за участие в групповом этапе
+  groupWin: 100_000,           // 100 тысяч за победу в группе
+  r16Participation: 110_000,   // 110 тысяч за участие в 1/8 финала
+  r16Win: 125_000,             // 125 тысяч за победу в 1/8 финала
+  qfParticipation: 110_000,    // 110 тысяч за участие в 1/4 финала
+  qfWin: 250_000,              // 250 тысяч за победу в 1/4 финала
+  sfParticipation: 110_000,    // 110 тысяч за участие в полуфинале Пути РПЛ
+  sfWin: 500_000,              // 500 тысяч за победу в полуфинале
+  finalWinner: 1_130_000,      // 1 130 000 € для победителя финала
+  finalRunnerUp: 380_000       // 380 000 € для проигравшего финалиста
+};
+
+function ensureInitialBudgets() {
+  if (!Array.isArray(db.budgetHistory)) db.budgetHistory = [];
+
+  let changed = false;
+  for (const t of db.teams) {
+    if (t.budget === undefined || (t.budget === 0 && INITIAL_RPL_BUDGETS[t.name] !== undefined)) {
+      if (INITIAL_RPL_BUDGETS[t.name] !== undefined) {
+        t.budget = INITIAL_RPL_BUDGETS[t.name];
+      } else if (t.comp === 'fnl') {
+        t.budget = 1_000_000;
+      } else {
+        t.budget = 500_000;
+      }
+      changed = true;
+    }
+  }
+
+  if (db.budgetHistory.length === 0) {
+    const rplTeams = db.teams.filter((t: any) => t.comp === 'rpl');
+    for (const t of rplTeams) {
+      db.budgetHistory.push({
+        id: uid(),
+        teamId: t.id,
+        teamName: t.name,
+        amount: t.budget || 0,
+        prevBudget: 0,
+        newBudget: t.budget || 0,
+        type: 'initial',
+        typeLabel: 'Стартовый бюджет сезона',
+        description: `Утверждён стартовый бюджет сезона 2026/27: €${(t.budget || 0).toLocaleString('ru-RU')}`,
+        date: '2026-07-01T10:00:00.000Z',
+        byAdmin: true
+      });
+    }
+    changed = true;
+  }
+
+  if (changed) save();
+}
+
+export function getPreviousSeason(season: string): string | null {
+  const parts = String(season || '').split('/');
+  if (parts.length === 2 && !isNaN(+parts[0])) {
+    const y1 = +parts[0] - 1;
+    const y2 = (+parts[1] - 1 + 100) % 100;
+    return `${y1}/${String(y2).padStart(2, '0')}`;
+  }
+  return null;
+}
+
+export function getTableForSeason(comp: string, targetSeason: string) {
+  if (targetSeason === S()) {
+    const cur = table(comp);
+    if (cur && cur.length) return cur;
+  }
+  const list = db.fixtures.filter((f: any) => f.season === targetSeason && f.comp === comp && f.status === 'done');
+  const teamIds = new Set<string>();
+  list.forEach((f: any) => {
+    if (f.home) teamIds.add(f.home);
+    if (f.away) teamIds.add(f.away);
+  });
+  if (!teamIds.size) {
+    db.teams.filter((t: any) => t.comp === comp).forEach((t: any) => teamIds.add(t.id));
+  }
+  const R: Record<string, any> = {};
+  teamIds.forEach(id => {
+    const tm = team(id);
+    R[id] = { id, name: tn(id), logo: teamLogo(id), p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, pts: 0 };
+  });
+  for (const f of list) {
+    for (const [t, gf, ga] of [[f.home, f.hg, f.ag], [f.away, f.ag, f.hg]]) {
+      const r = R[t];
+      if (!r) continue;
+      r.p++;
+      r.gf += (gf || 0);
+      r.ga += (ga || 0);
+      if (gf > ga) { r.w++; r.pts += 3; }
+      else if (gf === ga) { r.d++; r.pts += 1; }
+      else r.l++;
+    }
+  }
+  return Object.values(R).sort((a: any, b: any) => 
+    b.pts - a.pts || 
+    (b.gf - b.ga) - (a.gf - a.ga) || 
+    b.w - a.w || 
+    b.gf - a.gf || 
+    a.name.localeCompare(b.name)
+  );
+}
+
+export function getCupWinnerForSeason(targetSeason: string): { id: string; name: string } | null {
+  const cupFx = db.fixtures.filter((f: any) => f.season === targetSeason && f.comp === 'cup' && f.status === 'done');
+  const finalMatch = cupFx.find((f: any) => 
+    f.cupStage === 'superfinal' || 
+    f.cupStage === 'final' || 
+    (f.label && f.label.toLowerCase().includes('суперфинал')) ||
+    (f.label && f.label.toLowerCase().includes('финал') && !f.label.toLowerCase().includes('1/'))
+  );
+  if (finalMatch) {
+    const wId = winnerOf(finalMatch);
+    if (wId) return { id: wId, name: tn(wId) };
+  }
+  if (db.cupState2026 && db.cupState2026.season === targetSeason && (db.cupState2026 as any).winnerId) {
+    const wId = (db.cupState2026 as any).winnerId;
+    return { id: wId, name: tn(wId) };
+  }
+  return null;
+}
+
+export function determineSuperCupTeams(targetSeason?: string) {
+  const season = targetSeason || S();
+  const prevSeason = getPreviousSeason(season);
+  
+  const spartak = db.teams.find((t: any) => t.name === 'Спартак') || db.teams.find((t: any) => t.comp === 'rpl');
+  const zenit = db.teams.find((t: any) => t.name === 'Зенит') || db.teams.find((t: any) => t.comp === 'rpl' && t.id !== spartak?.id);
+
+  // Самый первый сезон проекта (2026/27 или нет предшествующего сезона)
+  const isFirstSeason = !prevSeason || season === '2026/27';
+
+  if (isFirstSeason) {
+    return {
+      homeId: spartak?.id || 'spartak',
+      homeName: spartak?.name || 'Спартак',
+      homeLogo: teamLogo(spartak?.id),
+      awayId: zenit?.id || 'zenit',
+      awayName: zenit?.name || 'Зенит',
+      awayLogo: teamLogo(zenit?.id),
+      reason: 'Матч за Суперкубок первого сезона: Спартак — Зенит',
+      isFirstSeason: true
+    };
+  }
+
+  // Следующие сезоны: Чемпион РПЛ vs Обладатель Кубка России
+  // Если это одна и та же команда (золотой дубль), то играет 2-е место РПЛ!
+  const prevRplTable = getTableForSeason('rpl', prevSeason);
+  const rplChamp = prevRplTable[0] || zenit;
+  const rplRunnerUp = prevRplTable.find((t: any) => t.id !== rplChamp.id) || (spartak?.id !== rplChamp.id ? spartak : db.teams.find((t: any) => t.comp === 'rpl' && t.id !== rplChamp.id));
+
+  const cupWinner = getCupWinnerForSeason(prevSeason);
+
+  let awayId = '';
+  let awayName = '';
+  let reason = '';
+
+  if (cupWinner && cupWinner.id && cupWinner.id !== rplChamp.id) {
+    awayId = cupWinner.id;
+    awayName = cupWinner.name;
+    reason = `Чемпион РПЛ (${rplChamp.name}) vs Обладатель Кубка России (${cupWinner.name})`;
+  } else if (cupWinner && cupWinner.id === rplChamp.id) {
+    awayId = rplRunnerUp.id;
+    awayName = rplRunnerUp.name;
+    reason = `Золотой дубль ${rplChamp.name} (победа в РПЛ и Кубке России) — соперник: 2-е место РПЛ (${rplRunnerUp.name})`;
+  } else {
+    // Победитель Кубка не определён или совпадает с чемпионом — играет 2-е место РПЛ
+    awayId = rplRunnerUp.id;
+    awayName = rplRunnerUp.name;
+    reason = `Чемпион РПЛ (${rplChamp.name}) vs 2-е место РПЛ (${rplRunnerUp.name})`;
+  }
+
+  return {
+    homeId: rplChamp.id,
+    homeName: rplChamp.name,
+    homeLogo: teamLogo(rplChamp.id),
+    awayId,
+    awayName,
+    awayLogo: teamLogo(awayId),
+    reason,
+    isFirstSeason: false
+  };
+}
+
+export function getSuperCupVenue(season: string) {
+  const startYear = parseInt(season.slice(0, 4), 10) || 2026;
+  if (season === '2026/27' || startYear === 2026) {
+    return {
+      stadium: 'Стадион «Нижний Новгород» (нейтральное поле, г. Нижний Новгород)',
+      city: 'Нижний Новгород',
+      neutralField: true
+    };
+  }
+  const stadiums = [
+    { stadium: '«Ак Барс Арена» (нейтральное поле, г. Казань)', city: 'Казань' },
+    { stadium: '«Газпром Арена» (нейтральное поле, г. Санкт-Петербург)', city: 'Санкт-Петербург' },
+    { stadium: '«Волгоград Арена» (нейтральное поле, г. Волгоград)', city: 'Волгоград' },
+    { stadium: '«Фишт» (нейтральное поле, г. Сочи)', city: 'Сочи' },
+    { stadium: '«Екатеринбург Арена» (нейтральное поле, г. Екатеринбург)', city: 'Екатеринбург' },
+    { stadium: '«Солидарность Самара Арена» (нейтральное поле, г. Самара)', city: 'Самара' },
+    { stadium: '«Ростов Арена» (нейтральное поле, г. Ростов-на-Дону)', city: 'Ростов-на-Дону' }
+  ];
+  const idx = Math.abs((startYear - 2027) % stadiums.length);
+  const venue = stadiums[idx] || stadiums[0];
+  return { ...venue, neutralField: true };
+}
+
+export function isFinalMatch(f: any): boolean {
+  if (!f) return false;
+  if (f.comp === 'supercup') return true;
+  if (f.cupStage === 'superfinal' || f.cupStage === 'final') return true;
+  if (f.label && typeof f.label === 'string') {
+    const l = f.label.toLowerCase();
+    if (l.includes('суперфинал') || l.includes('суперкубок')) return true;
+    if (l.includes('финал') && !l.includes('1/2') && !l.includes('1/4') && !l.includes('1/8') && !l.includes('1/16') && !l.includes('полуфинал')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function ensureSuperCupFixture(sName?: string, startDate?: string) {
+  const season = sName || S();
+  if (!Array.isArray(db.fixtures)) db.fixtures = [];
+
+  const teams = determineSuperCupTeams(season);
+  const startYear = parseInt(season.slice(0, 4), 10) || 2026;
+  const scDate = startDate 
+    ? addDays(startDate, -7) 
+    : (season === '2026/27' ? '2026-07-11' : `${startYear}-07-11`);
+
+  const venue = getSuperCupVenue(season);
+
+  const existing = db.fixtures.find((f: any) => f.comp === 'supercup' && f.season === season);
+  if (existing) {
+    existing.neutralField = true;
+    if (season === '2026/27' || startYear === 2026) {
+      existing.stadium = 'Стадион «Нижний Новгород» (нейтральное поле, г. Нижний Новгород)';
+      existing.city = 'Нижний Новгород';
+    } else if (!existing.stadium || !existing.stadium.includes('нейтральное')) {
+      existing.stadium = venue.stadium;
+      existing.city = venue.city;
+    }
+    if (existing.status === 'scheduled') {
+      existing.home = teams.homeId;
+      existing.away = teams.awayId;
+      existing.label = 'Суперкубок России · Финал';
+      existing.note = teams.reason;
+      if (startDate && (!existing.date || existing.date >= startDate)) {
+        existing.date = scDate;
+        existing.gameDate = scDate;
+      }
+    }
+    save();
+    return existing;
+  }
+
+  const newFx = {
+    id: uid(),
+    comp: 'supercup',
+    season,
+    round: 1,
+    cupPath: 'supercup',
+    label: 'Суперкубок России · Финал',
+    note: teams.reason,
+    home: teams.homeId,
+    away: teams.awayId,
+    date: scDate,
+    time: '17:30',
+    gameDate: scDate,
+    gameTime: '17:30',
+    stadium: venue.stadium,
+    city: venue.city,
+    status: 'scheduled',
+    hg: null,
+    ag: null,
+    neutralField: true
+  };
+
+  db.fixtures.unshift(newFx);
+  assignReferee(newFx);
+  save();
+  return newFx;
+}
+
+function calculateCupPrizeSuggestions() {
+  const rplTeams = db.teams.filter((t: any) => t.comp === 'rpl');
+  const suggestions: any[] = [];
+  const cupFx = (db.fixtures || []).filter((f: any) => f.comp === 'cup');
+
+  for (const t of rplTeams) {
+    let stage = 'Групповой этап';
+    let base = CUP_PRIZE_SCALE.groupParticipation; // 300_000
+    let groupWins = 0;
+    let r16Wins = 0;
+    let qfWins = 0;
+    let sfWins = 0;
+    let isFinalWinner = false;
+    let isFinalRunnerUp = false;
+
+    // Считаем сыгранные матчи Кубка для клуба
+    for (const f of cupFx) {
+      if (f.status !== 'done') continue;
+      const isHome = f.home === t.id;
+      const isAway = f.away === t.id;
+      if (!isHome && !isAway) continue;
+
+      const teamWon = (isHome && f.homeScore > f.awayScore) || (isAway && f.awayScore > f.homeScore);
+      const isPenWon = f.penalties && ((isHome && f.homePen > f.awayPen) || (isAway && f.awayPen > f.homePen));
+      const won = teamWon || isPenWon;
+
+      const label = String(f.label || '').toLowerCase();
+      const stageField = String(f.stage || '').toLowerCase();
+
+      if (label.includes('финал') && !label.includes('1/2') && !label.includes('1/4') && !label.includes('1/8')) {
+        stage = 'Финал Кубка России';
+        if (won) isFinalWinner = true;
+        else isFinalRunnerUp = true;
+      } else if (label.includes('1/2') || stageField.includes('semi')) {
+        stage = 'Полуфинал Пути РПЛ';
+        if (won) sfWins++;
+      } else if (label.includes('1/4') || stageField.includes('quarter')) {
+        stage = '1/4 финала';
+        if (won) qfWins++;
+      } else if (label.includes('1/8') || stageField.includes('r16')) {
+        stage = '1/8 финала';
+        if (won) r16Wins++;
+      } else {
+        if (won) groupWins++;
+      }
+    }
+
+    let totalPrize = base + (groupWins * CUP_PRIZE_SCALE.groupWin);
+    if (stage === '1/8 финала') {
+      totalPrize += CUP_PRIZE_SCALE.r16Participation + (r16Wins * CUP_PRIZE_SCALE.r16Win);
+    } else if (stage === '1/4 финала') {
+      totalPrize += CUP_PRIZE_SCALE.r16Participation + CUP_PRIZE_SCALE.qfParticipation + (qfWins * CUP_PRIZE_SCALE.qfWin);
+    } else if (stage === 'Полуфинал Пути РПЛ') {
+      totalPrize += CUP_PRIZE_SCALE.r16Participation + CUP_PRIZE_SCALE.qfParticipation + CUP_PRIZE_SCALE.sfParticipation + (sfWins * CUP_PRIZE_SCALE.sfWin);
+    } else if (stage === 'Финал Кубка России') {
+      totalPrize += CUP_PRIZE_SCALE.r16Participation + CUP_PRIZE_SCALE.qfParticipation + CUP_PRIZE_SCALE.sfParticipation + (isFinalWinner ? CUP_PRIZE_SCALE.finalWinner : CUP_PRIZE_SCALE.finalRunnerUp);
+    }
+
+    suggestions.push({
+      teamId: t.id,
+      teamName: t.name,
+      logo: teamLogo(t.id),
+      stage,
+      groupWins,
+      playoffWins: r16Wins + qfWins + sfWins,
+      prize: totalPrize,
+      formattedPrize: '€' + totalPrize.toLocaleString('ru-RU'),
+      breakdown: `Участие €300K + ${groupWins} побед в группе (€${(groupWins * 100).toLocaleString('ru-RU')}K)`
+    });
+  }
+
+  return suggestions.sort((a, b) => b.prize - a.prize);
+}
+
+async function getTransferAiAdvice(t: any, p: any, fromT: any, toT: any) {
+  const pName = p?.name || t.playerName || 'Футболист';
+  const pos = p?.pos || t.pos || 'Игрок';
+  const playerAge = p ? (p.age || 25) : 25;
+  const fromName = fromT?.name || t.fromName || 'Прежний клуб';
+  const toName = toT?.name || t.toName || 'Новый клуб';
+  const fee = t.fee || 'По согласованию';
+  const typeStr = t.type === 'loan' ? 'Аренда' : 'Полноценный трансфер';
+  const stats = p ? `Матчей: ${p.matches || 0}, голов: ${p.goals || 0}, ассистов: ${p.assists || 0}, ср. оценка: ${Number(p.rating || 7.0).toFixed(2)}, OVR: ${p.ovr || 75}` : 'Статистика формируется';
+
+  const sys = 'Ты — главный спортивный директор и финансовый консультант лиги Вирт РПЛ. Проанализируй трансферную сделку между российскими клубами и дай профессиональный вердикт для администратора лиги. Ответь строго в JSON.';
+  const prompt = `Сделка:
+Игрок: ${pName} (${pos}, возраст: ${playerAge} лет, гражданин: ${p?.nat || 'Россия'})
+Статистика: ${stats}
+Продавец / отдающий клуб: "${fromName}"
+Покупатель / принимающий клуб: "${toName}"
+Тип сделки: ${typeStr} (условия: ${t.note || 'Стандартные'})
+Заявленная сумма сделки: ${fee}
+
+Дай аргументированный вердикт в формате JSON:
+{
+  "verdict": "Рекомендуется одобрить" | "Рекомендуется отклонить" | "Спорная сделка (требует внимания)",
+  "ratingScore": 8,
+  "fairPrice": "например, €6.0M – €7.5M",
+  "financialAnalysis": "краткий финансовый аудит (адекватность цены, выгода для продавца, нагрузка на бюджет покупателя)",
+  "sportAnalysis": "спортивная польза (как игрок усилит состав покупателя и как потеря скажется на продавце)",
+  "risks": "основные риски (адаптация, лимит легионеров, возраст, травматичность)",
+  "recommendation": "чёткое резюме для администратора (одобрять или нет, и почему)"
+}`;
+
+  if (hasLLM()) {
+    try {
+      const parsed: any = await llmJSON(sys, prompt, { task: 'transfer-advice', temp: 0.4, max: 2000 });
+      if (parsed?.verdict) return parsed;
+    } catch (e: any) {
+      console.error('AI advice error:', e.message);
+    }
+  }
+
+  // Эвристический финансово-спортивный советник при отсутствии прямого ключа
+  const feeNum = parseFeeAmount(fee);
+  const ovr = p?.ovr || 74;
+  const estimatedValue = Math.max(0.5, Math.round(((ovr - 65) * 0.85 + (30 - Math.min(32, playerAge)) * 0.3) * 10) / 10);
+  const diff = feeNum - estimatedValue;
+
+  let verdict = 'Рекомендуется одобрить';
+  let ratingScore = 8;
+  if (diff > 5) {
+    verdict = 'Спорная сделка (требует внимания)';
+    ratingScore = 5;
+  } else if (diff > 9) {
+    verdict = 'Рекомендуется отклонить';
+    ratingScore = 3;
+  } else if (diff < -2) {
+    verdict = 'Рекомендуется одобрить';
+    ratingScore = 9;
+  }
+
+  return {
+    verdict,
+    ratingScore,
+    fairPrice: `€${Math.max(0.3, (estimatedValue * 0.85)).toFixed(1)}M – €${(estimatedValue * 1.25).toFixed(1)}M`,
+    financialAnalysis: feeNum > 0
+      ? `Заявленная сумма ${fee} ${Math.abs(diff) <= 2 ? 'находится в пределах рыночного диапазона РПЛ' : diff > 2 ? 'существенно превышает ориентировочную рыночную стоимость (переплата покупателя)' : 'выгодна для покупателя (дисконт к рыночной оценке)'}.`
+      : 'Сделка оформляется на правах свободной компенсации или аренды.',
+    sportAnalysis: `Футболист ${pName} (${pos}) усилит центральную ось клуба «${toName}». Для клуба «${fromName}» сделка ${diff >= 0 ? 'позволит разгрузить зарплатную ведомость и заработать' : 'требует поиска срочной замены в основу'}.`,
+    risks: playerAge > 30 ? 'Возрастной фактор, возможен спад физических кондиций.' : playerAge < 21 ? 'Молодой возраст, риск нестабильности в ключевых матчах.' : 'Риск тактической адаптации к требованиям нового тренера.',
+    recommendation: verdict === 'Рекомендуется одобрить'
+      ? `Трансфер реалистичен и полезен обеим сторонам. Рекомендуется дать одобрение сделки.`
+      : verdict === 'Спорная сделка (требует внимания)'
+      ? `Покупатель переплачивает, но если позиция критична для схемы, сделку можно санкционировать.`
+      : `Сделка финансово раздута. Рекомендуется отклонить или запросить пересмотр суммы компенсации.`
+  };
+}
 
 /* ───────── таблицы и статистика ───────── */
 function table(comp: string, beforeDate?: string) {
@@ -895,19 +1670,47 @@ function agg() {
 const invalidateAgg = () => { aggCache = null; };
 
 /* ───────── LLM ───────── */
+function getGeminiKeys(): string[] {
+  const raw: string[] = [];
+  if (process.env.GEMINI_API_KEYS) raw.push(...process.env.GEMINI_API_KEYS.split(/[\n,;]+/));
+  if (process.env.GEMINI_API_KEY) raw.push(...process.env.GEMINI_API_KEY.split(/[\n,;]+/));
+  for (let i = 1; i <= 10; i++) {
+    const k = (process.env as any)[`GEMINI_API_KEY_${i}`];
+    if (k) raw.push(k);
+  }
+  const dbG = db.settings?.keys?.gemini;
+  if (typeof dbG === 'string') raw.push(...dbG.split(/[\n,;]+/));
+  else if (Array.isArray(dbG)) raw.push(...dbG);
+  raw.push(...HARDCODED.geminiKeys);
+
+  const seen = new Set<string>();
+  const res: string[] = [];
+  for (const s of raw) {
+    const clean = String(s || '').trim();
+    if (clean && !seen.has(clean) && !clean.includes('•')) {
+      seen.add(clean);
+      res.push(clean);
+    }
+  }
+  return res;
+}
 function provList() {
   const k = db.settings.keys || {}, m = db.settings.models || {}, L: any[] = [];
-  const g = process.env.GEMINI_API_KEY || k.gemini;
-  const q = process.env.GROQ_API_KEY || k.groq;
-  const o = process.env.OPENROUTER_API_KEY || k.openrouter;
-  if (g) L.push({ n: 'gemini', key: g, model: process.env.GEMINI_MODEL || m.gemini || 'gemini-3.8-flash', max: 32000 });
-  if (q) L.push({ n: 'groq', key: q, base: 'https://api.groq.com/openai/v1', model: process.env.GROQ_MODEL || m.groq || 'openai/gpt-oss-120b', max: 8000 });
-  if (o) L.push({ n: 'openrouter', key: o, base: 'https://openrouter.ai/api/v1', model: process.env.OPENROUTER_MODEL || m.openrouter || 'openrouter/free', max: 8000 });
+  const gKeys = getGeminiKeys();
+  const q = process.env.GROQ_API_KEY || k.groq || HARDCODED.groqKey;
+  const o = process.env.OPENROUTER_API_KEY || k.openrouter || HARDCODED.openrouterKey;
+  const gModel = process.env.GEMINI_MODEL || m.gemini || HARDCODED.geminiModel || 'gemini-3.8-flash';
+  for (let i = 0; i < gKeys.length; i++) {
+    L.push({ n: 'gemini', id: `gemini_proj_${i + 1}`, key: gKeys[i], model: gModel, max: 32000 });
+  }
+  if (q) L.push({ n: 'groq', id: 'groq', key: q, base: 'https://api.groq.com/openai/v1', model: process.env.GROQ_MODEL || m.groq || 'openai/gpt-oss-120b', max: 8000 });
+  if (o) L.push({ n: 'openrouter', id: 'openrouter', key: o, base: 'https://openrouter.ai/api/v1', model: process.env.OPENROUTER_MODEL || m.openrouter || 'openrouter/free', max: 8000 });
   return L;
 }
 const hasLLM = () => provList().length > 0;
 function httpErr(status: number, body: any) {
-  return Object.assign(new Error(`HTTP ${status}: ${JSON.stringify(body).slice(0, 200)}`), { status });
+  const raw = JSON.stringify(body);
+  return Object.assign(new Error(`HTTP ${status}: ${raw.slice(0, 200)}`), { status, daily: /PerDay|per day|daily/i.test(raw) });
 }
 async function callProv(p: any, sys: string, user: string, o: any) {
   const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 170000);
@@ -943,9 +1746,18 @@ function llog(e: any) {
   db.llmlog.push({ ts: Date.now(), ...e });
   if (db.llmlog.length > 200) db.llmlog.shift();
 }
+/* Ключи, у которых кончился лимит (429) или которые отвергнуты (401/403), на время пропускаются */
+const keyCooldown = new Map<string, number>();
+const coolKey = (p: any, e: any) => {
+  const ms = e.daily ? 60 * 60_000 : e.status === 429 ? 90_000 : 60 * 60_000;
+  keyCooldown.set(p.key, Date.now() + ms);
+};
 async function llm(sys: string, user: string, { json = true, task = '', temp = 0.9, max = 16000, grounded = false } = {}) {
-  const L = provList();
-  if (!L.length) throw Object.assign(new Error('Нет ключей нейросети'), { noLLM: true });
+  const all = provList();
+  if (!all.length) throw Object.assign(new Error('Нет ключей нейросети'), { noLLM: true });
+  const now0 = Date.now();
+  let L = all.filter((p: any) => (keyCooldown.get(p.key) || 0) <= now0);
+  if (!L.length) L = all; // все на паузе — пробуем всё равно, лимит мог сброситься
   let last: any;
   for (const p of L) {
     for (let a = 0; a < 2; a++) {
@@ -953,12 +1765,17 @@ async function llm(sys: string, user: string, { json = true, task = '', temp = 0
       try {
         const text = await callProv(p, sys, user, { json, temp, max, grounded });
         if (!text.trim()) throw new Error('пустой ответ');
-        llog({ task, p: p.n, ok: 1, ms: Date.now() - t0 });
+        llog({ task, p: p.id || p.n, ok: 1, ms: Date.now() - t0 });
         return text;
       } catch (e: any) {
         last = e;
-        llog({ task, p: p.n, ok: 0, ms: Date.now() - t0, err: e.message.slice(0, 160) });
-        if (e.status === 429) { await sleep(2500); break; }
+        llog({ task, p: p.id || p.n, ok: 0, ms: Date.now() - t0, err: e.message.slice(0, 160) });
+        if (e.status === 429 || e.status === 401 || e.status === 403) coolKey(p, e);
+        if (e.status === 429) {
+          console.warn(`[LLM Failover] Ключ ${p.id || p.n} исчерпал лимит (HTTP 429). Мгновенное переключение на резервный ключ...`);
+          await sleep(500);
+          break;
+        }
         if (e.status >= 500 || e.name === 'AbortError') await sleep(1500);
         else if (e.status) break;
       }
@@ -1034,47 +1851,23 @@ async function createPlayers(names: string[], teamId: string | null, hint?: stri
 /* ───────── погода ───────── */
 const wcache = new Map<string, string>();
 async function weather(tm: any, date: string, time: string) {
-  const hour = parseInt((time || '17:00').slice(0, 2));
-  const key = [tm?.id, date, hour].join();
+  const city = (tm?.city || 'Москва').trim();
+  const hour = parseInt((time || '17:00').slice(0, 2), 10) || 17;
+  const key = [city, date, hour].join(':');
   if (wcache.has(key)) return wcache.get(key)!;
-  let txt = 'данных о погоде нет — оцени сам по региону и дате; время суток учитывай';
-  try {
-    if (tm && tm.lat != null) {
-      const days = daysBetween(new Date().toISOString().slice(0, 10), date);
-      let temp: any, wind: any, rain: any, snow = 0, src: any;
-      if (days <= 14) {
-        const j: any = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${tm.lat}&longitude=${tm.lon}&hourly=temperature_2m,precipitation,snowfall,wind_speed_10m&start_date=${date}&end_date=${date}&timezone=auto`)).json();
-        if (j.hourly) {
-          const i = clamp(hour, 0, 23);
-          temp = j.hourly.temperature_2m[i];
-          wind = j.hourly.wind_speed_10m[i] / 3.6;
-          rain = j.hourly.precipitation[i];
-          snow = j.hourly.snowfall[i];
-          src = 'прогноз';
-        }
-      }
-      if (temp == null) {
-        const y = +date.slice(0, 4);
-        const res = await Promise.all([1, 2, 3, 4, 5].map(k => fetch(`https://archive-api.open-meteo.com/v1/archive?latitude=${tm.lat}&longitude=${tm.lon}&start_date=${y - k}${date.slice(4)}&end_date=${y - k}${date.slice(4)}&daily=temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max&timezone=auto`).then(r => r.json()).catch(() => null)));
-        const d = res.map((r: any) => r?.daily).filter(Boolean);
-        if (d.length) {
-          const av = (k: string) => d.reduce((s, x) => s + (x[k]?.[0] || 0), 0) / d.length;
-          const mean = av('temperature_2m_mean'), mx = av('temperature_2m_max'), mn = av('temperature_2m_min');
-          temp = hour < 17 ? mean + (mx - mean) * 0.7 : mean - (mean - mn) * 0.4;
-          wind = av('wind_speed_10m_max') / 3.6 * 0.6;
-          rain = av('precipitation_sum') / 6;
-          src = 'обычная погода на эту дату по данным прошлых лет';
-        }
-      }
-      if (temp != null) {
-        const ppt = rain > 0.2 ? (temp <= 0 || snow > 0 ? 'снег' : 'дождь') : 'без осадков';
-        const pitch = temp <= -3 ? 'газон подмёрзший и жёсткий' : (ppt === 'дождь' ? 'газон мокрый, скользкий' : ppt === 'снег' ? 'газон заснежен' : temp >= 28 ? 'газон сухой, жара' : 'газон в норме');
-        txt = `около ${Math.round(temp)}°C, ветер ~${Math.round(wind)} м/с, ${ppt}; ${pitch} (${src})`;
-      }
-    }
-  } catch { }
-  wcache.set(key, txt);
-  return txt;
+
+  const dbKey = `${city}_${date}`;
+  if (db?.dailyWeather && db.dailyWeather[dbKey]?.text) {
+    const txt = db.dailyWeather[dbKey].text;
+    wcache.set(key, txt);
+    return txt;
+  }
+
+  const w = calculateMatchWeather(city, date, time);
+  if (!db.dailyWeather) db.dailyWeather = {};
+  db.dailyWeather[dbKey] = w;
+  wcache.set(key, w.text);
+  return w.text;
 }
 
 /* ───────── составы ───────── */
@@ -1185,12 +1978,34 @@ function fatText(tid: string, f: any) {
   if (f.away === tid) { const d = km(team(f.away), team(f.home)); if (d) s += ` Дорога в гости ≈ ${d} км.`; }
   return s;
 }
+function teamStatsSummary(tid: string, comp: string) {
+  const allP = Object.values<any>(agg().P).filter(x => x.t === tid && x.comp === comp);
+  const topG = allP.filter(x => x.g > 0).sort((a, b) => b.g - a.g).slice(0, 3).map(x => `${x.n} (${x.g} гол.)`);
+  const topA = allP.filter(x => x.a > 0).sort((a, b) => b.a - a.a).slice(0, 3).map(x => `${x.n} (${x.a} пас.)`);
+  const cards = allP.filter(x => (x.yc || 0) + (x.rc || 0) * 2 > 0).sort((a, b) => (b.yc + b.rc * 2) - (a.yc + a.rc * 2)).slice(0, 3).map(x => `${x.n} (${x.yc} ЖК${x.rc ? `, ${x.rc} КК` : ''})`);
+  const tStats = Object.values<any>(agg().T).find(x => x.tid === tid && x.comp === comp);
+  let res = '';
+  if (topG.length) res += `Бомбардиры: ${topG.join(', ')}. `;
+  if (topA.length) res += `Ассистенты: ${topA.join(', ')}. `;
+  if (cards.length) res += `Дисциплина (риск нарушений): ${cards.join(', ')}. `;
+  if (tStats) res += `Командные показатели (${tStats.m} игр): забито ${tStats.g || 0}, xG ${+(tStats.xg || 0).toFixed(1)}, фолы ${tStats.fo || 0}, ЖК ${tStats.yc || 0}${tStats.rc ? `, КК ${tStats.rc}` : ''}.`;
+  return res.trim() || 'Статистика сезона накапливается (первые туры чемпионата).';
+}
+function staffSummary(tid: string) {
+  const staff = getStaffForTeam(tid);
+  if (!staff.length) return 'нет данных о расширенном штабе';
+  return staff.slice(0, 4).map(s => `${s.roleTitle || s.role}: ${s.name}`).join('; ');
+}
 function cardLine(p: any, date: string) {
+  if (!p) return 'Игрок (нет данных)';
   const a = age(p, date), ag = agg().P;
   let seas = '';
   const row = Object.values<any>(ag).filter(x => x.pid === p.id && x.comp === 'rpl')[0];
-  if (row) seas = ` В этом сезоне в игре: ${row.m} матчей, ${row.g} гол., ${row.a} пас.`;
-  return `${p.pos} ${p.name}${a ? `, ${a} лет` : ''} — стиль: ${p.style || 'нет данных'}. Достижения: ${(p.achievements || []).join('; ') || 'нет данных'}. Статистика 2 сезонов: ${p.stats2y || 'нет данных'}. Форма: ${p.form || 'нет данных'}.${seas} Характер: ${p.character || 'нет данных'}. Новости: ${p.news || 'нет'}.`;
+  if (row) seas = ` В сезоне: ${row.m} игр, ${row.g} гол., ${row.a} пас., ${row.yc || 0} ЖК${row.rc ? `, ${row.rc} КК` : ''}${row.cs ? `, ${row.cs} сухих матчей` : ''}.`;
+  const foot = p.foot ? `, рабочая нога: ${p.foot}` : '';
+  const nat = p.nation ? `, гражданство: ${p.nation}` : (p.nat ? `, страна: ${p.nat}` : '');
+  const real = p.realClub ? `, реальный клуб: ${p.realClub}` : '';
+  return `${p.pos || 'ПЗ'} ${p.name}${a ? `, ${a} лет` : ''}${nat}${foot}${real} — стиль: ${p.style || 'сбалансированный'}. Достижения: ${(p.achievements || []).join('; ') || 'опыт выступлений'}. Статистика 2 сезонов: ${p.stats2y || 'регулярная игровая практика'}. Форма: ${p.form || 'стабильная'}.${seas} Характер: ${p.character || 'хладнокровный, командный игрок'}. Новости: ${p.news || 'готовится к матчу в штатном режиме'}.`;
 }
 async function buildCtx(f: any) {
   const ctx: any = { fid: f.id, comp: compName(f), roundLabel: roundLabel(f), date: f.date, time: f.time, names: {}, pidSide: {}, pidTeam: {}, pos: {}, lineup: {}, sides: {} };
@@ -1199,21 +2014,50 @@ async function buildCtx(f: any) {
     home: { id: H.id, name: H.name, logo: teamLogo(H.id) },
     away: { id: A.id, name: A.name, logo: teamLogo(A.id) }
   };
-  ctx.stadium = (H.stadium ? H.stadium + ', ' : '') + (H.city || '');
+  const isFinal = isFinalMatch(f);
+  const isNeutral = !!(f.neutralField || isFinal);
+  if (isFinal && f.comp === 'cup') {
+    ctx.stadium = 'БСА «Лужники» (нейтральное поле, г. Москва)';
+  } else if (isFinal && f.comp === 'supercup') {
+    if (f.season === '2026/27' || String(f.date || '').startsWith('2026')) {
+      ctx.stadium = 'Стадион «Нижний Новгород» (нейтральное поле, г. Нижний Новгород)';
+    } else {
+      ctx.stadium = f.stadium || getSuperCupVenue(f.season || S()).stadium;
+    }
+  } else if (f.stadium) {
+    ctx.stadium = f.stadium + (f.city && !f.stadium.includes(f.city) ? ', ' + f.city : '');
+  } else {
+    ctx.stadium = (H?.stadium ? H.stadium + ', ' : '') + (H?.city || '');
+  }
+  ctx.neutralField = isNeutral;
   for (const s of ['home', 'away']) {
     const tid = f[s], L = getLineup(f, tid); ctx.lineup[s] = L;
-    for (const pid of [...L.starters, ...L.bench]) {
-      const p = player(pid);
-      if (p) {
-        ctx.names[pid] = p.name;
-        ctx.pidSide[pid] = s;
-        ctx.pidTeam[pid] = tid;
-        ctx.pos[pid] = p.pos;
+    if (L.starters.length === 0) {
+      const defaultPositions = ['ВР', 'ПЗ', 'ЦЗ', 'ЦЗ', 'ЛЗ', 'ОП', 'ЦП', 'АП', 'ПВ', 'ЛВ', 'ЦФ'];
+      for (let i = 0; i < 11; i++) {
+        const dummyId = `match_${tid}_${i + 1}`;
+        const pPos = defaultPositions[i];
+        const pName = `Игрок ${i + 1} (${tn(tid)})`;
+        ctx.names[dummyId] = pName;
+        ctx.pidSide[dummyId] = s;
+        ctx.pidTeam[dummyId] = tid;
+        ctx.pos[dummyId] = pPos;
+        L.starters.push(dummyId);
+      }
+    } else {
+      for (const pid of [...L.starters, ...L.bench]) {
+        const p = player(pid);
+        if (p) {
+          ctx.names[pid] = p.name;
+          ctx.pidSide[pid] = s;
+          ctx.pidTeam[pid] = tid;
+          ctx.pos[pid] = p.pos;
+        }
       }
     }
   }
   const dv = db.derbies.find((d: any) => (d.a === f.home && d.b === f.away) || (d.a === f.away && d.b === f.home));
-  ctx.derby = dv ? `${dv.name}. ${dv.note}` : 'нет';
+  ctx.derby = dv ? `${dv.name}. ${dv.note}` : 'нет (обычный календарный матч)';
   ctx.motiv = { home: motivText(f.home, f), away: motivText(f.away, f) };
   const top = Object.values<any>(agg().P).filter(x => x.comp === 'rpl' && x.g > 0).sort((a: any, b: any) => b.g - a.g).slice(0, 5);
   ctx.race = top.length ? top.map((x: any) => `${x.n} (${tn(x.t)}) — ${x.g}`).join('; ') : 'пока нет данных';
@@ -1224,41 +2068,145 @@ async function buildCtx(f: any) {
 
   const cH = getCoachForTeam(f.home), cA = getCoachForTeam(f.away);
   ctx.coaches = {
-    home: { coach: cH, synergy: computeCoachSynergy(cH, ctx.lineup.home) },
-    away: { coach: cA, synergy: computeCoachSynergy(cA, ctx.lineup.away) }
+    home: { coach: cH, synergy: computeCoachSynergy(cH, ctx.lineup.home), staff: getStaffForTeam(f.home) },
+    away: { coach: cA, synergy: computeCoachSynergy(cA, ctx.lineup.away), staff: getStaffForTeam(f.away) }
+  };
+  ctx.teamStats = {
+    home: teamStatsSummary(f.home, f.comp),
+    away: teamStatsSummary(f.away, f.comp)
+  };
+  ctx.staff = {
+    home: staffSummary(f.home),
+    away: staffSummary(f.away)
+  };
+  const comp = f.comp;
+  const rows = table(comp, f.date);
+  const rH = rows.find((x: any) => x.id === f.home);
+  const rA = rows.find((x: any) => x.id === f.away);
+  ctx.tableStandings = {
+    home: rH ? `${rH.pos}-е место (${rH.pts} очк., ${rH.p} игр, ${rH.w}В ${rH.d}Н ${rH.l}П, мячи ${rH.gf}-${rH.ga}, разница ${rH.gd >= 0 ? '+' + rH.gd : rH.gd}, форма: ${rH.form || '—'}, зона: ${rH.zoneLabel || 'середина таблицы'})` : 'начало турнира',
+    away: rA ? `${rA.pos}-е место (${rA.pts} очк., ${rA.p} игр, ${rA.w}В ${rA.d}Н ${rA.l}П, мячи ${rA.gf}-${rA.ga}, разница ${rA.gd >= 0 ? '+' + rA.gd : rA.gd}, форма: ${rA.form || '—'}, зона: ${rA.zoneLabel || 'середина таблицы'})` : 'начало турнира'
+  };
+
+  if (!f.refereeName && (f.comp === 'rpl' || f.comp === 'cup')) {
+    assignReferee(f);
+  }
+  const headRef = db.referees?.find((r: any) => r.id === f.refereeId || r.name === f.refereeName) || (f.refereeName ? {
+    name: f.refereeName,
+    city: 'Россия',
+    style: 'balanced',
+    styleDesc: 'Последовательный арбитр, держит дисциплину',
+    rating: 7.5,
+    bio: `Главный арбитр встречи — ${f.refereeName}`,
+    matches: 0, yellows: 0, reds: 0, penalties: 0
+  } : null);
+  const varRef = db.referees?.find((r: any) => r.name === f.varReferee) || (f.varReferee ? {
+    name: f.varReferee,
+    style: 'ВАР-арбитр',
+    styleDesc: 'Опытный видеоассистент VAR',
+    bio: `Арбитр VAR — ${f.varReferee}`
+  } : null);
+  const assts = Array.isArray(f.assistants) && f.assistants.length >= 2 ? f.assistants : ['Дмитрий Мосякин', 'Валентин Мурашов'];
+  ctx.refereeCrew = {
+    head: headRef,
+    asst1: assts[0],
+    asst2: assts[1],
+    fourth: f.reserveReferee || 'Вера Опейкина',
+    var: f.varReferee || (f.comp === 'rpl' ? 'Сергей Карасев' : null),
+    varProfile: varRef,
+    avar: f.avarReferee || (f.comp === 'rpl' ? 'Павел Кукуян' : null)
   };
   return ctx;
 }
 function lineText(ctx: any, s: string) {
   const L = ctx.lineup[s], f = ctx.date, sd = ctx.sides[s];
   const row = (pid: string) => cardLine(player(pid), f);
-  return `СОСТАВ ${sd.name} (схема ${L.formation}), стартовые:\n${L.starters.map((p: string) => '- ' + row(p)).join('\n')}\nСкамейка:\n${L.bench.map((p: string) => '- ' + row(p)).join('\n')}\nНедоступны: ${ctx.missing[s].join(', ') || 'нет'}`;
+  return `СОСТАВ ${sd.name} (схема ${L.formation}), стартовые 11:\n${L.starters.map((p: string) => '- ' + row(p)).join('\n')}\nСкамейка запасных:\n${L.bench.map((p: string) => '- ' + row(p)).join('\n')}\nНедоступны (травмы/дисквалификации): ${ctx.missing[s].join(', ') || 'нет'}`;
 }
 function buildUser(ctx: any, a: number, b: number, st: any, issues: string) {
   const H = ctx.sides.home.name, A = ctx.sides.away.name;
-  const sp = (s: string) => (ctx.lineup[s].speech || '').trim() ? `«${ctx.lineup[s].speech.trim()}»` : '(тренер промолчал — пустая речь, тоже сигнал команде)';
-  const tr = (s: string) => (ctx.lineup[s].training || '').trim() ? `«${ctx.lineup[s].training.trim()}»` : '(тренировочный план не указан — отдельной подготовки к матчу не было)';
+  const sp = (s: string) => (ctx.lineup[s].speech || '').trim() ? `«${ctx.lineup[s].speech.trim()}»` : '(тренер промолчал перед выходом — команда действует по стандартному плану)';
+  const tr = (s: string) => (ctx.lineup[s].training || '').trim() ? `«${ctx.lineup[s].training.trim()}»` : '(тренировочный микроцикл: общекомандная подготовка, отработка тактических связок и стандартов)';
   const cInfo = (s: string) => {
     const c = ctx.coaches[s];
-    return `${c.coach.name} (философия: ${c.coach.styleTitle}). Тактическая совместимость: ${c.synergy.statusTitle} (${c.synergy.score}%). ${c.synergy.description}`;
+    const staffNote = ctx.staff?.[s] && ctx.staff[s] !== 'нет данных о расширенном штабе' ? ` Тренерский штаб: ${ctx.staff[s]}.` : '';
+    return `${c.coach.name} (${c.coach.nationality || 'Россия'}, ${c.coach.age || 45} лет, философия: ${c.coach.styleTitle || c.coach.style}). Характер на бровке: ${c.coach.temperament || 'уравновешенный'}. Любимая схема: ${c.coach.favoriteFormation || '4-3-3'}. Цитата: ${c.coach.quote || '«Играть на победу»'}. Тактическая синергия: ${c.synergy.statusTitle} (${c.synergy.score}%). ${c.synergy.description}.${staffNote}`;
   };
-  let u = `ПЕРИОД: минуты ${a}–${b}\n`;
-  if (st) u += `СОСТОЯНИЕ МАТЧА НА МОМЕНТ НАЧАЛА ПЕРИОДА: счёт ${st.score[0]}:${st.score[1]}; жёлтые: ${H}: ${st.yellows.home.join(', ') || 'нет'}, ${A}: ${st.yellows.away.join(', ') || 'нет'}; удалены: ${st.reds.join(', ') || 'нет'}; покинули поле (травма/замена): ${st.off.join(', ') || 'нет'}; замены: ${H} ${st.subs.home}/5, ${A} ${st.subs.away}/5. Заменившие вышли на поле: ${st.ins.join(', ') || 'нет'}.${st.note ? ` Заметка о ходе игры: ${st.note}` : ''}\nПоследние события: ${st.last.join(' | ') || '—'}\n`;
-  u += `\nМАТЧ: ${H} — ${A} | ${ctx.comp}, ${ctx.roundLabel} | ${ctx.date} ${ctx.time} | Стадион: ${ctx.stadium}\n`;
-  u += `\nКОНТЕКСТ ОБЕИХ КОМАНД (учитывай обе стороны):\n- ${ctx.motiv.home}\n- ${ctx.motiv.away}\n- ПРОТИВОСТОЯНИЕ: ${ctx.derby}\n- Гонка бомбардиров РПЛ: ${ctx.race}\n`;
-  u += `\nПОГОДА И ПОЛЕ: ${ctx.weather}\n`;
-  u += `\nРАСПИСАНИЕ И УСТАЛОСТЬ:\n- ${H}: ${ctx.fat.home}\n- ${A}: ${ctx.fat.away}\n`;
-  u += `\nГЛАВНЫЕ ТРЕНЕРЫ И ТАКТИЧЕСКАЯ СИНЕРГИЯ:\n- ${H}: ${cInfo('home')}\n- ${A}: ${cInfo('away')}\n`;
-  u += `\nТРЕНИРОВОЧНЫЙ ПЛАН (текст тренера, как есть):\n- ${H}: ${tr('home')}\n- ${A}: ${tr('away')}\n`;
-  u += `\nТАКТИКА / РЕЧЬ ТРЕНЕРА ПЕРЕД МАТЧЕМ (как есть):\n- ${H}, схема ${ctx.lineup.home.formation}: ${sp('home')}\n- ${A}, схема ${ctx.lineup.away.formation}: ${sp('away')}\n`;
-  u += `\n${lineText(ctx, 'home')}\n\n${lineText(ctx, 'away')}\n`;
-  if (issues) u += `\nВНИМАНИЕ: прошлая попытка отклонена из-за проблем: ${issues}. Исправь их.\n`;
-  u += `\nСыграй период (минуты ${a}–${b}). Верни только JSON по формату из инструкции.`;
+
+  const refInfo = () => {
+    const rc = ctx.refereeCrew;
+    if (!rc || !rc.head) return 'Судейская бригада: назначение на матч стандартное.';
+    const h = rc.head;
+    let s = `Главный судья: ${h.name} (${h.city || 'РФ'}, рейтинг ${h.rating || 7.5}/10, стиль: ${h.style || 'сбалансированный'}).\n  Манера судейства: ${h.styleDesc || h.bio || 'держит игру под контролем'}. Статистика: ${h.matches || 0} матчей, ${h.yellows || 0} ЖК, ${h.reds || 0} КК, ${h.penalties || 0} пенальти.`;
+    s += `\n  Помощники на линиях: 1-й ассистент — ${rc.asst1}, 2-й ассистент — ${rc.asst2}.`;
+    s += `\n  Резервный арбитр: ${rc.fourth}.`;
+    if (rc.var) {
+      s += `\n  Видеоассистенты (VAR): Главный ВАР — ${rc.var}${rc.varProfile ? ` (${rc.varProfile.styleDesc || 'опытный видеосудья'})` : ''}, АВАР — ${rc.avar || 'ассистент ВАР'}.`;
+    }
+    return s;
+  };
+
+  let u = `═══ МАТЧ: ${H} — ${A} | ${ctx.comp}, ${ctx.roundLabel} | ${ctx.date} ${ctx.time} | Стадион: ${ctx.stadium}${ctx.neutralField ? ' [НЕЙТРАЛЬНОЕ ПОЛЕ — ФИНАЛ]' : ''} ═══\n`;
+  if (ctx.neutralField) {
+    u += `ФАКТОР НЕЙТРАЛЬНОГО ПОЛЯ: Матч проводится на нейтральном стадионе! Преимущества домашнего поля нет ни у одной из команд. Поддержка трибун разделена поровну.\n\n`;
+  }
+  u += `ОТРЕЗОК ИГРЫ: минуты ${a}–${b}\n\n`;
+
+  if (st) {
+    u += `ТЕКУЩЕЕ СОСТОЯНИЕ МАТЧА (к минуте ${a}):\n`;
+    u += `- Счёт: ${H} ${st.score[0]}:${st.score[1]} ${A}\n`;
+    u += `- Предупреждения (ЖК): ${H}: ${st.yellows.home.join(', ') || 'нет'} | ${A}: ${st.yellows.away.join(', ') || 'нет'}\n`;
+    u += `- Удаления (КК): ${st.reds.join(', ') || 'нет'}\n`;
+    u += `- Покинули поле (травма/замена): ${st.off.join(', ') || 'нет'}\n`;
+    u += `- Использовано замен: ${H} ${st.subs.home}/5, ${A} ${st.subs.away}/5 (вышли: ${st.ins.join(', ') || 'нет'})\n`;
+    if (st.note) u += `- Ход игры и моментум: ${st.note}\n`;
+    u += `- Хроника последних минут: ${st.last.join(' | ') || 'начало встречи'}\n\n`;
+  }
+
+  u += `1. ТУРНИРНАЯ ТАБЛИЦА И ТУРНИРНОЕ ЗНАЧЕНИЕ:\n`;
+  u += `- Положение ${H}: ${ctx.tableStandings.home}\n`;
+  u += `- Положение ${A}: ${ctx.tableStandings.away}\n`;
+  u += `- Мотивация ${H}: ${ctx.motiv.home}\n`;
+  u += `- Мотивация ${A}: ${ctx.motiv.away}\n`;
+  u += `- СТАТУС ДЕРБИ / ПРИНЦИПИАЛЬНОСТЬ: ${ctx.derby}\n`;
+  u += `- Гонка бомбардиров чемпионата: ${ctx.race}\n\n`;
+
+  u += `2. СТАТИСТИКА КОМАНД В ТУРНИРЕ:\n`;
+  u += `- ${H}: ${ctx.teamStats.home}\n`;
+  u += `- ${A}: ${ctx.teamStats.away}\n\n`;
+
+  u += `3. СУДЕЙСКАЯ БРИГАДА И VAR:\n${refInfo()}\n\n`;
+
+  u += `4. ПОГОДА, ГАЗОН И ФИЗИЧЕСКИЙ ГРАФИК:\n`;
+  u += `- Погода и газон: ${ctx.weather}\n`;
+  u += `- Физическое состояние и график ${H}: ${ctx.fat.home}\n`;
+  u += `- Физическое состояние и график ${A}: ${ctx.fat.away}\n\n`;
+
+  u += `5. ГЛАВНЫЕ ТРЕНЕРЫ И ШТАБ:\n`;
+  u += `- ${H}: ${cInfo('home')}\n`;
+  u += `- ${A}: ${cInfo('away')}\n\n`;
+
+  u += `6. ТРЕНИРОВОЧНЫЙ ПРОЦЕСС И ПРЕДМАТЧЕВЫЙ ПЛАН:\n`;
+  u += `- Недельный цикл ${H}: ${tr('home')}\n`;
+  u += `- Недельный цикл ${A}: ${tr('away')}\n\n`;
+
+  u += `7. ТАКТИЧЕСКИЕ СХЕМЫ И УСТАНОВКА НА ИГРУ:\n`;
+  u += `- ${H} (схема ${ctx.lineup.home.formation}): ${sp('home')}\n`;
+  u += `- ${A} (схема ${ctx.lineup.away.formation}): ${sp('away')}\n\n`;
+
+  u += `8. СОСТАВЫ И ПРОФИЛИ ИГРОКОВ (используй исключительно этих игроков):\n`;
+  u += `${lineText(ctx, 'home')}\n\n${lineText(ctx, 'away')}\n`;
+
+  if (issues) {
+    u += `\nВНИМАНИЕ! Прошлая попытка генерации была отклонена: ${issues}. Строго устрани указанные замечания!\n`;
+  }
+
+  u += `\nСгенерируй отрезок матча (минуты ${a}–${b}) строго в валидном JSON без markdown-обёртки по правилам 10 разделов симулятора.`;
   return u;
 }
 
 /* ───────── обработка событий ───────── */
-const TYPES = new Set('kickoff possession pass dribble tackle duel foul yellow red shot save miss post goal own_goal penalty offside corner freekick injury sub var ref_error incident highlight halftime fulltime'.split(' '));
+const TYPES = new Set('kickoff possession pass dribble tackle duel foul yellow red shot save miss post goal own_goal penalty offside corner freekick injury sub var ref_error incident cooling_break highlight halftime fulltime'.split(' '));
 function indexNames(ctx: any) {
   return Object.entries<string>(ctx.names).map(([pid, n]) => ({ pid, side: ctx.pidSide[pid], full: norm(n), last: norm(n).split(' ').pop() }));
 }
@@ -1285,7 +2233,7 @@ function deriveState(events: any[], ctx: any, note?: string) {
     if (e.type === 'yellow' && nm(0)) st.yellows[e.team]?.push(nm(0));
     if (e.type === 'red' && nm(0)) { st.reds.push(nm(0)); st.off.push(nm(0)); }
     if (e.type === 'sub') { st.subs[e.team]++; if (nm(1)) st.off.push(nm(1)); if (nm(0)) st.ins.push(nm(0)); }
-    if (e.type === 'injury' && nm(0)) st.off.push(nm(0));
+    if (e.type === 'injury' && nm(0) && (e.out_days === undefined || e.out_days > 0)) st.off.push(nm(0));
   }
   return st;
 }
@@ -1311,18 +2259,19 @@ function normalizeEvents(raw: any[], a: number, b: number, ctx: any, prev: any[]
     if (!team) team = pids[0] ? ctx.pidSide[pids[0]] : 'none';
     if (type === 'own_goal' && !['home', 'away'].includes(team)) { probs.push('автогол без команды'); continue; }
     const actor = (type === 'sub' || type === 'save') ? null : pids[0];
-    if (actor && off.has(norm(ctx.names[actor])) && !['yellow', 'red', 'injury', 'foul'].includes(type) && !['var', 'incident', 'highlight'].includes(type)) {
+    if (actor && off.has(norm(ctx.names[actor])) && !['yellow', 'red', 'injury', 'foul'].includes(type) && !['var', 'incident', 'cooling_break', 'highlight'].includes(type)) {
       probs.push(`${ctx.names[actor]} действует после ухода с поля`);
     }
+    const outDays = type === 'injury' ? (e.out_days !== undefined ? (isNaN(+e.out_days) ? 14 : clamp(Math.round(+e.out_days), 0, 240)) : 14) : undefined;
     if (type === 'red' && pids[0]) off.add(norm(ctx.names[pids[0]]));
-    if (type === 'injury' && pids[0]) off.add(norm(ctx.names[pids[0]]));
+    if (type === 'injury' && pids[0] && (outDays === undefined || outDays > 0)) off.add(norm(ctx.names[pids[0]]));
     if (type === 'sub') {
       if (['home', 'away'].includes(team)) { if (++subs[team] > 5) probs.push('больше 5 замен'); }
       if (pids[1]) off.add(norm(ctx.names[pids[1]]));
     }
     const ev: any = { min, sec, team, type, players: names, pids, text: String(e.text || '').slice(0, 500) };
     if (type === 'shot' || type === 'penalty') ev.xg = clamp(+e.xg || (type === 'penalty' ? 0.76 : 0.08), 0.01, 0.95);
-    if (type === 'injury') ev.out_days = clamp(Math.round(+e.out_days) || 14, 1, 240);
+    if (type === 'injury') ev.out_days = outDays;
     out.push(ev);
   }
   {
@@ -1578,7 +2527,8 @@ function finish(id: string) {
   m.motm = getMatchMotm(m, f, HName, AName, cH, cA);
   if (m.motm) f.motm = { pid: m.motm.pid, name: m.motm.name, rating: m.motm.rating };
   putMatch(id, m);
-  if (f.comp === 'cup' && f.hg === f.ag && !f.pen) f.pen = shootout(f);
+  if ((f.comp === 'cup' || f.comp === 'supercup') && f.hg === f.ag && !f.pen) f.pen = shootout(f);
+  checkPlayoffShootout(f);
   f.status = 'done';
   updateRefereeStats(f, m.events);
   if (f.comp === 'cup') advanceCup();
@@ -1595,7 +2545,7 @@ function finish(id: string) {
   for (const e of m.events) {
     const p = player(e.pids?.[0]);
     if (!p) continue;
-    if (e.type === 'injury') p.out = { until: addDays(f.date, e.out_days || 14), reason: e.text.slice(0, 120) };
+    if (e.type === 'injury' && (e.out_days === undefined || e.out_days > 0)) p.out = { until: addDays(f.date, e.out_days || 14), reason: e.text.slice(0, 120) };
     if (e.type === 'red') p.banLeft = 1;
     if (e.type === 'yellow') {
       p.seasonYC = (p.seasonYC || 0) + 1;
@@ -1605,6 +2555,14 @@ function finish(id: string) {
   invalidateAgg();
   advanceCup();
   save();
+  checkForeignInterestAfterMatch(db, m, f).then((newOffers) => {
+    if (newOffers && newOffers.length > 0) {
+      save();
+      for (const o of newOffers) {
+        tg(`🌍 <b>Трансферный интерес из-за рубежа!</b>\nКлуб «${esc(o.buyerClub)}» (${esc(o.buyerCountry)}) сделал официальное предложение по игроку <b>${esc(o.playerName)}</b> («${esc(o.clubName)}») на сумму <b>${esc(o.fee)}</b>!\n<i>«${esc(o.scoutReport)}»</i>`);
+      }
+    }
+  }).catch((err) => console.error('Ошибка проверки скаутов:', err));
   const st = f.st;
   tg(`🏁 <b>Итог: ${esc(tn(f.home))} ${f.hg}:${f.ag} ${esc(tn(f.away))}</b>${f.pen ? ` (пен. ${f.pen.hg}:${f.pen.ag})` : ''}\nВладение ${st.poss[0]}–${st.poss[1]}, удары ${st.teams.home.sh}–${st.teams.away.sh}, xG ${st.teams.home.xg}–${st.teams.away.xg}${db.settings.siteUrl ? `\n${esc(db.settings.siteUrl)}/#/match/${id}` : ''}`);
   pushLive(id, { type: 'end' });
@@ -1615,6 +2573,23 @@ function shootout(f: any) {
   let h = 3 + Math.floor(r() * 3), a = 3 + Math.floor(r() * 3);
   if (h === a) { r() < .5 ? h++ : a++; }
   return { hg: h, ag: a, winner: h > a ? 'home' : 'away' };
+}
+function checkPlayoffShootout(f: any) {
+  if (f.comp !== 'playoff' && f.comp !== 'playoff_rpl_fnl') return;
+  if (f.playoffLeg === 2) {
+    const leg1 = db.fixtures.find((x: any) => x.season === f.season && x.playoffTieId === f.playoffTieId && x.playoffLeg === 1);
+    if (leg1 && (leg1.status === 'done' || leg1.hg !== null)) {
+      const aggH = (leg1.ag || 0) + (f.hg || 0);
+      const aggA = (leg1.hg || 0) + (f.ag || 0);
+      if (aggH === aggA && !f.pen) {
+        f.pen = shootout(f);
+      }
+    }
+  } else if (!f.playoffLeg || f.playoffLeg === 1 && f.playoffTieId?.startsWith('media')) {
+    if (f.hg === f.ag && !f.pen) {
+      f.pen = shootout(f);
+    }
+  }
 }
 function resumeLive() {
   for (const f of db.fixtures) {
@@ -1628,7 +2603,7 @@ function resumeLive() {
 const tgQ: string[] = [];
 let tgBusy = false;
 function tg(text: string) {
-  if (!db.settings.tgToken || !db.settings.tgChat) return;
+  if (!tgToken() || !tgChat()) return;
   tgQ.push(text);
   tgPump();
 }
@@ -1638,8 +2613,8 @@ async function tgPump() {
   while (tgQ.length) {
     const t = tgQ.shift()!;
     try {
-      const r = await fetch(`https://api.telegram.org/bot${db.settings.tgToken}/sendMessage`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: db.settings.tgChat, text: t, parse_mode: 'HTML', disable_web_page_preview: true })
+      const r = await fetch(`https://api.telegram.org/bot${tgToken()}/sendMessage`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: tgChat(), text: t, parse_mode: 'HTML', disable_web_page_preview: true })
       });
       if (r.status === 429) {
         const j: any = await r.json().catch(() => ({}));
@@ -1690,13 +2665,15 @@ async function bgResults(list: any[]) {
     let x = Array.isArray(res) ? res.find(z => z && z.id === f.id) : null;
     if (!x || !Number.isInteger(+x.hg) || !Number.isInteger(+x.ag) || +x.hg > 9 || +x.ag > 9) {
       const r = rng(f.id + Date.now());
-      x = { hg: poisson(1.45, r), ag: poisson(1.1, r) };
+      const isNeutral = !!(f.neutralField || isFinalMatch(f));
+      x = { hg: poisson(isNeutral ? 1.25 : 1.45, r), ag: poisson(isNeutral ? 1.25 : 1.1, r) };
     }
     f.hg = +x.hg; f.ag = +x.ag; f.note = x.note || '';
-    if (f.comp === 'cup' && f.hg === f.ag) {
+    if ((f.comp === 'cup' || f.comp === 'supercup') && f.hg === f.ag) {
       const w = x.winner === 'home' || x.winner === 'away' ? x.winner : (rng(f.id)() < .5 ? 'home' : 'away');
       f.pen = { hg: w === 'home' ? 5 : 4, ag: w === 'home' ? 4 : 5, winner: w };
     }
+    checkPlayoffShootout(f);
     f.status = 'done';
     f.st = null;
     const hSq = squadOf(f.home), aSq = squadOf(f.away);
@@ -1783,6 +2760,7 @@ function genSeason(start: string, name: string) {
 
   // Очищаем старые матчи текущего сезона перед генерацией
   db.fixtures = db.fixtures.filter((f: any) => f.season !== season);
+  ensureSuperCupFixture(season);
 
   const r = rng('season' + name);
   for (const comp of COMPS.filter(x => x.type === 'league')) {
@@ -1908,6 +2886,7 @@ function genSeason(start: string, name: string) {
   db.fixtures.push(...cupFixtures);
 
   db.players.forEach((p: any) => { p.seasonYC = 0; p.banLeft = 0; });
+  ensureDualTimes(season, true);
   invalidateAgg();
   save();
 }
@@ -2051,12 +3030,579 @@ function advanceCup() {
     });
     save();
   }
+
+  // Проверяем завершение 1/8 финала и создаем 1/4 финала
+  const existingQF = seasonFx().filter((f: any) => f.comp === 'cup' && f.cupStage === 'rpl_playoff_qf');
+  const r16Done = existingR16.length >= 8 && existingR16.every((f: any) => f.status === 'done');
+  const regR16 = seasonFx().filter((f: any) => f.comp === 'cup' && f.cupStage === 'regions_r16');
+  const regR16Done = regR16.length >= 4 && regR16.every((f: any) => f.status === 'done');
+
+  if (r16Done && regR16Done && !existingQF.length) {
+    const rplWinners: string[] = [];
+    for (let i = 1; i <= 4; i++) {
+      const leg1 = existingR16.find((f: any) => f.tieId === `r16_${i}` && f.leg === 1);
+      const leg2 = existingR16.find((f: any) => f.tieId === `r16_${i}` && f.leg === 2);
+      if (leg1 && leg2) {
+        const teamA = leg2.home;
+        const teamB = leg1.home;
+        const gA = (leg1.ag || 0) + (leg2.hg || 0);
+        const gB = (leg1.hg || 0) + (leg2.ag || 0);
+        if (gA > gB) rplWinners.push(teamA);
+        else if (gB > gA) rplWinners.push(teamB);
+        else {
+          const w = leg2.pen?.winner === 'home' ? teamA : teamB;
+          rplWinners.push(w);
+        }
+      }
+    }
+    const regWinners = regR16.map(winnerOf).filter(Boolean);
+
+    if (rplWinners.length >= 4) {
+      const qfTies = [
+        { a: rplWinners[0], b: rplWinners[1], name: '1/4 финала Пути РПЛ · Пара 1' },
+        { a: rplWinners[2], b: rplWinners[3], name: '1/4 финала Пути РПЛ · Пара 2' }
+      ];
+      qfTies.forEach((tie, idx) => {
+        const f1 = {
+          id: uid(), season: S(), comp: 'cup', cupPath: 'rpl_playoff', cupStage: 'rpl_playoff_qf',
+          tieId: `qf_${idx + 1}`, leg: 1, round: 211, label: `${tie.name} (1-й матч)`,
+          date: '2027-04-07', time: idx === 0 ? '18:00' : '20:30', home: tie.b, away: tie.a,
+          status: 'scheduled', hg: null, ag: null, pos: 0
+        };
+        const f2 = {
+          id: uid(), season: S(), comp: 'cup', cupPath: 'rpl_playoff', cupStage: 'rpl_playoff_qf',
+          tieId: `qf_${idx + 1}`, leg: 2, round: 212, label: `${tie.name} (Ответный матч)`,
+          date: '2027-04-21', time: idx === 0 ? '18:00' : '20:30', home: tie.a, away: tie.b,
+          status: 'scheduled', hg: null, ag: null, pos: 0
+        };
+        assignReferee(f1); assignReferee(f2);
+        db.fixtures.push(f1, f2);
+      });
+    }
+
+    if (regWinners.length >= 4) {
+      const f1 = {
+        id: uid(), season: S(), comp: 'cup', cupPath: 'regions_playoff', cupStage: 'regions_qf',
+        round: 311, label: 'Путь регионов · 1/4 финала (на вылет)',
+        date: '2027-04-14', time: '17:30', home: regWinners[0], away: regWinners[1],
+        status: 'scheduled', hg: null, ag: null, pos: 0
+      };
+      const f2 = {
+        id: uid(), season: S(), comp: 'cup', cupPath: 'regions_playoff', cupStage: 'regions_qf',
+        round: 311, label: 'Путь регионов · 1/4 финала (на вылет)',
+        date: '2027-04-14', time: '20:00', home: regWinners[2], away: regWinners[3],
+        status: 'scheduled', hg: null, ag: null, pos: 0
+      };
+      assignReferee(f1); assignReferee(f2);
+      db.fixtures.push(f1, f2);
+    }
+    save();
+  }
+
+  // Полуфиналы:
+  const existingSF = seasonFx().filter((f: any) => f.comp === 'cup' && f.cupStage === 'rpl_playoff_sf');
+  const qfDone = existingQF.length >= 4 && existingQF.every((f: any) => f.status === 'done');
+  const regQF = seasonFx().filter((f: any) => f.comp === 'cup' && f.cupStage === 'regions_qf');
+  const regQFDone = regQF.length >= 2 && regQF.every((f: any) => f.status === 'done');
+
+  if (qfDone && regQFDone && !existingSF.length) {
+    const qf1_1 = existingQF.find((f: any) => f.tieId === 'qf_1' && f.leg === 1);
+    const qf1_2 = existingQF.find((f: any) => f.tieId === 'qf_1' && f.leg === 2);
+    const qf2_1 = existingQF.find((f: any) => f.tieId === 'qf_2' && f.leg === 1);
+    const qf2_2 = existingQF.find((f: any) => f.tieId === 'qf_2' && f.leg === 2);
+    const w1 = qf1_1 && qf1_2 ? ((qf1_1.ag + qf1_2.hg > qf1_1.hg + qf1_2.ag) ? qf1_2.home : qf1_1.home) : null;
+    const w2 = qf2_1 && qf2_2 ? ((qf2_1.ag + qf2_2.hg > qf2_1.hg + qf2_2.ag) ? qf2_2.home : qf2_1.home) : null;
+    const regSfTeams = regQF.map(winnerOf).filter(Boolean);
+
+    if (w1 && w2) {
+      const f1 = {
+        id: uid(), season: S(), comp: 'cup', cupPath: 'rpl_playoff', cupStage: 'rpl_playoff_sf',
+        tieId: 'sf_1', leg: 1, round: 221, label: 'Финал Пути РПЛ (1-й матч)',
+        date: '2027-05-05', time: '19:30', home: w2, away: w1,
+        status: 'scheduled', hg: null, ag: null, pos: 0
+      };
+      const f2 = {
+        id: uid(), season: S(), comp: 'cup', cupPath: 'rpl_playoff', cupStage: 'rpl_playoff_sf',
+        tieId: 'sf_1', leg: 2, round: 222, label: 'Финал Пути РПЛ (Ответный матч)',
+        date: '2027-05-19', time: '19:30', home: w1, away: w2,
+        status: 'scheduled', hg: null, ag: null, pos: 0
+      };
+      assignReferee(f1); assignReferee(f2);
+      db.fixtures.push(f1, f2);
+    }
+    if (regSfTeams.length >= 2) {
+      const fReg = {
+        id: uid(), season: S(), comp: 'cup', cupPath: 'regions_playoff', cupStage: 'regions_final',
+        round: 321, label: 'Финал Пути регионов (на вылет)',
+        date: '2027-05-12', time: '19:00', home: regSfTeams[0], away: regSfTeams[1],
+        status: 'scheduled', hg: null, ag: null, pos: 0
+      };
+      assignReferee(fReg);
+      db.fixtures.push(fReg);
+    }
+    save();
+  }
+
+  // Суперфинал Кубка России (всегда в Лужниках на нейтральном поле):
+  const sfDone = existingSF.length >= 2 && existingSF.every((f: any) => f.status === 'done');
+  const regFin = seasonFx().filter((f: any) => f.comp === 'cup' && f.cupStage === 'regions_final');
+  const regFinDone = regFin.length >= 1 && regFin.every((f: any) => f.status === 'done');
+  const existingSuperFinal = seasonFx().find((f: any) => f.comp === 'cup' && (f.cupStage === 'superfinal' || f.cupPath === 'superfinal'));
+
+  if (sfDone && regFinDone && !existingSuperFinal) {
+    if (db.cupState2026) db.cupState2026.stage = 'final';
+    const sf1 = existingSF.find((f: any) => f.leg === 1);
+    const sf2 = existingSF.find((f: any) => f.leg === 2);
+    const wRpl = sf1 && sf2 ? ((sf1.ag + sf2.hg > sf1.hg + sf2.ag) ? sf2.home : sf1.home) : null;
+    const wReg = winnerOf(regFin[0]);
+
+    if (wRpl && wReg) {
+      const superfinal = {
+        id: uid(),
+        season: S(),
+        comp: 'cup',
+        cupPath: 'superfinal',
+        cupStage: 'superfinal',
+        round: 500,
+        label: 'Суперфинал FONBET Кубка России',
+        date: db.cupState2026?.finalDate || '2027-06-06',
+        time: '18:00',
+        gameDate: db.cupState2026?.finalDate || '2027-06-06',
+        gameTime: '18:00',
+        home: wRpl,
+        away: wReg,
+        status: 'scheduled',
+        hg: null,
+        ag: null,
+        stadium: 'БСА «Лужники» (нейтральное поле, г. Москва)',
+        city: 'Москва',
+        neutralField: true,
+        pos: 0
+      };
+      assignReferee(superfinal);
+      db.fixtures.push(superfinal);
+      if (db.cupState2026) {
+        db.cupState2026.playoff = db.cupState2026.playoff || {};
+        db.cupState2026.playoff.superFinal = superfinal;
+      }
+      save();
+    }
+  }
+
+  // Гарантия: все финалы Кубка России в Лужниках на нейтральном поле, первый Суперкубок в Нижнем Новгороде
+  db.fixtures.forEach((f: any) => {
+    if (f.comp === 'cup' && (f.cupStage === 'superfinal' || f.cupPath === 'superfinal' || isFinalMatch(f))) {
+      f.stadium = 'БСА «Лужники» (нейтральное поле, г. Москва)';
+      f.city = 'Москва';
+      f.neutralField = true;
+    } else if (f.comp === 'supercup') {
+      f.neutralField = true;
+      if (f.season === '2026/27' || String(f.date || '').startsWith('2026')) {
+        f.stadium = 'Стадион «Нижний Новгород» (нейтральное поле, г. Нижний Новгород)';
+        f.city = 'Нижний Новгород';
+      }
+    } else if (isFinalMatch(f)) {
+      f.neutralField = true;
+    }
+  });
+  save();
 }
 
-function performSeasonRotation() {
+export function realAt(f: any): Date {
+  const d = f.realDate || f.date || '2026-11-07';
+  const t = f.realTime || f.time || '12:00';
+  // Standard MSK timezone is UTC+3
+  return new Date(`${d}T${t}:00+03:00`);
+}
+
+export function getAvailableSeasons(): string[] {
+  const set = new Set<string>();
+  if (db.settings?.season) set.add(db.settings.season);
+  if (Array.isArray(db.fixtures)) {
+    db.fixtures.forEach((f: any) => { if (f.season) set.add(f.season); });
+  }
+  const cur = S();
+  const parts = cur.split('/');
+  if (parts.length === 2 && !isNaN(+parts[0])) {
+    const next = `${+parts[0] + 1}/${(+parts[1] + 1) % 100}`;
+    set.add(next);
+  }
+  return Array.from(set).sort();
+}
+
+export function ensureDualTimes(targetSeason?: string, force = false) {
+  const season = targetSeason || S();
+  const seasonFixtures = db.fixtures.filter((f: any) => f.season === season);
+  if (!seasonFixtures.length) return;
+
+  const baseRealStart = db.settings.realStartDate || new Date().toISOString().slice(0, 10);
+
+  // 1. Fill gameDate and gameTime from date and time
+  seasonFixtures.forEach((f: any) => {
+    if (!f.gameDate || force) f.gameDate = f.date;
+    if (!f.gameTime || force) f.gameTime = f.time;
+  });
+
+  // 2. Strict sequential calendar for RPL, Russian Cup, and Super Cup:
+  // "это касается не только, но и кубка России. Это действует только на кубок России и рпл, 
+  // получается если идет рпл, то в этот день только рпл, если наступило время кубка России, 
+  // то идет кубок России, мы двигаемся строго по расписанию виртуального времени."
+  const rplAndCupFx = seasonFixtures.filter((f: any) => f.comp === 'rpl' || f.comp === 'cup' || f.comp === 'supercup');
+  
+  const tourBlocks = new Map<string, { key: string; comp: string; minGameDate: string; fixtures: any[] }>();
+
+  rplAndCupFx.forEach((f: any) => {
+    let tourKey = '';
+    if (f.comp === 'supercup') {
+      tourKey = 'supercup';
+    } else if (f.comp === 'rpl') {
+      tourKey = `rpl_tour_${String(f.round).padStart(2, '0')}`;
+    } else { // cup
+      if (f.cupPath === 'regions_qual') {
+        tourKey = `cup_regions_r${f.qualRound || f.round}`;
+      } else if (f.cupPath === 'rpl_group') {
+        tourKey = `cup_rpl_grp_r${f.round}`;
+      } else {
+        tourKey = `cup_stage_${f.cupStage || f.round}`;
+      }
+    }
+
+    if (!tourBlocks.has(tourKey)) {
+      tourBlocks.set(tourKey, {
+        key: tourKey,
+        comp: f.comp,
+        minGameDate: f.gameDate || f.date,
+        fixtures: []
+      });
+    }
+    const b = tourBlocks.get(tourKey)!;
+    b.fixtures.push(f);
+    if ((f.gameDate || f.date) < b.minGameDate) {
+      b.minGameDate = f.gameDate || f.date;
+    }
+  });
+
+  // Sort tour blocks strictly by chronological order of virtual calendar:
+  const sortedBlocks = Array.from(tourBlocks.values()).sort((a, b) => a.minGameDate.localeCompare(b.minGameDate));
+
+  // Each tour block gets exactly ONE real calendar day
+  sortedBlocks.forEach((block, blockIndex) => {
+    const realDayDate = addDays(baseRealStart, blockIndex);
+    const N = block.fixtures.length;
+    
+    // Sort matches deterministically
+    block.fixtures.sort((a, b) => a.id.localeCompare(b.id));
+
+    // Random times generator (по МСК)
+    // 1 match at night (e.g. 01:00 or 01:30)
+    // Remaining matches during daytime and evening (10:00 to 22:30)
+    const randomTimes: string[] = [];
+    const nightSlots = ['00:30', '01:00', '01:15', '01:30', '02:00'];
+    const rGen = rng(season + '_' + block.key + '_' + blockIndex);
+
+    if (N >= 2) {
+      const nightIdx = Math.floor(rGen() * nightSlots.length);
+      randomTimes.push(nightSlots[nightIdx]);
+    }
+
+    const dayStartMin = 10 * 60; // 10:00 MSK
+    const dayEndMin = 22 * 60 + 30; // 22:30 MSK
+    const remainingCount = N >= 2 ? N - 1 : N;
+
+    const daySlots: number[] = [];
+    for (let i = 0; i < remainingCount; i++) {
+      const step = (dayEndMin - dayStartMin) / Math.max(1, remainingCount);
+      const baseMin = dayStartMin + i * step;
+      const jitter = (rGen() - 0.5) * 40;
+      let slot = Math.round((baseMin + jitter) / 15) * 15;
+      slot = Math.max(dayStartMin, Math.min(dayEndMin, slot));
+      daySlots.push(slot);
+    }
+    daySlots.sort((a, b) => a - b);
+    for (let i = 1; i < daySlots.length; i++) {
+      if (daySlots[i] <= daySlots[i - 1]) {
+        daySlots[i] = daySlots[i - 1] + 30;
+      }
+    }
+
+    daySlots.forEach(slotMin => {
+      const hh = String(Math.floor(slotMin / 60)).padStart(2, '0');
+      const mm = String(slotMin % 60).padStart(2, '0');
+      randomTimes.push(`${hh}:${mm}`);
+    });
+
+    block.fixtures.forEach((f: any, fi: number) => {
+      if (!f.realDate || force) f.realDate = realDayDate;
+      if (!f.realTime || force) f.realTime = randomTimes[fi] || '14:00';
+    });
+  });
+
+  // 3. For any other leagues (fnl, 2la, media, etc.)
+  seasonFixtures.filter((f: any) => f.comp !== 'rpl' && f.comp !== 'cup' && f.comp !== 'supercup').forEach((f: any) => {
+    const rnd = Number(f.round) || 1;
+    if (!f.realDate || force) {
+      f.realDate = addDays(baseRealStart, rnd - 1);
+    }
+    if (!f.realTime || force) {
+      f.realTime = f.time || '14:00';
+    }
+  });
+}
+
+function getSeasonPlayoffs(targetSeason?: string) {
+  const season = targetSeason || S();
+  const rplRows = table('rpl');
+  const fnlRows = table('fnl');
+  const goldRows = table('2la_gold');
+  const mediaRows = table('media');
+
+  const rpl13 = rplRows[12] || { id: 'rubin', name: 'Рубин', pos: 13 };
+  const rpl14 = rplRows[13] || { id: 'fakel', name: 'Факел', pos: 14 };
+  const fnl3 = fnlRows[2] || { id: 'volga-ulyanovsk', name: 'Волга Ульяновск', pos: 3 };
+  const fnl4 = fnlRows[3] || { id: 'yenisey', name: 'Енисей', pos: 4 };
+  const fnl16 = fnlRows[15] || { id: 'sokol', name: 'Сокол', pos: 16 };
+  const gold3 = goldRows[2] || { id: 'mashuk-kmv', name: 'Машук-КМВ', pos: 3 };
+  const media5 = mediaRows[4] || { id: '2drots', name: '2Drots', pos: 5 };
+  const media6 = mediaRows[5] || { id: 'brokeboys', name: 'Броуки (Brokeboys)', pos: 6 };
+  const media7 = mediaRows[6] || { id: 'amkal', name: 'Амкал', pos: 7 };
+  const media8 = mediaRows[7] || { id: 'lit_energy', name: 'Lit Energy', pos: 8 };
+
+  const allPlayoffFx = (db.fixtures || []).filter((f: any) => f.season === season && (f.comp === 'playoff' || f.comp === 'playoff_rpl_fnl'));
+
+  const tieDefs = [
+    {
+      id: 'rpl_fnl_1',
+      category: 'rpl_fnl',
+      categoryTitle: 'Стыки: РПЛ ⇄ Первая лига (Пара 1)',
+      title: `${rpl13.name} (13-е РПЛ) — ${fnl4.name} (4-е ФНЛ)`,
+      twoLegged: true,
+      teamHigher: { id: rpl13.id, name: rpl13.name, comp: 'rpl', place: 13, logo: teamLogo(rpl13.id) },
+      teamLower: { id: fnl4.id, name: fnl4.name, comp: 'fnl', place: 4, logo: teamLogo(fnl4.id) }
+    },
+    {
+      id: 'rpl_fnl_2',
+      category: 'rpl_fnl',
+      categoryTitle: 'Стыки: РПЛ ⇄ Первая лига (Пара 2)',
+      title: `${rpl14.name} (14-е РПЛ) — ${fnl3.name} (3-е ФНЛ)`,
+      twoLegged: true,
+      teamHigher: { id: rpl14.id, name: rpl14.name, comp: 'rpl', place: 14, logo: teamLogo(rpl14.id) },
+      teamLower: { id: fnl3.id, name: fnl3.name, comp: 'fnl', place: 3, logo: teamLogo(fnl3.id) }
+    },
+    {
+      id: 'fnl_gold_1',
+      category: 'fnl_gold',
+      categoryTitle: 'Стыки: Первая лига ⇄ 2-я лига «А» «Золото»',
+      title: `${fnl16.name} (16-е ФНЛ) — ${gold3.name} (3-е Золото)`,
+      twoLegged: true,
+      teamHigher: { id: fnl16.id, name: fnl16.name, comp: 'fnl', place: 16, logo: teamLogo(fnl16.id) },
+      teamLower: { id: gold3.id, name: gold3.name, comp: '2la_gold', place: 3, logo: teamLogo(gold3.id) }
+    },
+    {
+      id: 'media_playin_1',
+      category: 'media',
+      categoryTitle: 'Стыки Медиалиги (MFL Плей-ин, Пара 1)',
+      title: `${media5.name} (5-е MFL) — ${media8.name} (8-е MFL)`,
+      twoLegged: false,
+      teamHigher: { id: media5.id, name: media5.name, comp: 'media', place: 5, logo: teamLogo(media5.id) },
+      teamLower: { id: media8.id, name: media8.name, comp: 'media', place: 8, logo: teamLogo(media8.id) }
+    },
+    {
+      id: 'media_playin_2',
+      category: 'media',
+      categoryTitle: 'Стыки Медиалиги (MFL Плей-ин, Пара 2)',
+      title: `${media6.name} (6-е MFL) — ${media7.name} (7-е MFL)`,
+      twoLegged: false,
+      teamHigher: { id: media6.id, name: media6.name, comp: 'media', place: 6, logo: teamLogo(media6.id) },
+      teamLower: { id: media7.id, name: media7.name, comp: 'media', place: 7, logo: teamLogo(media7.id) }
+    }
+  ];
+
+  const ties = tieDefs.map(def => {
+    const fxList = allPlayoffFx.filter((f: any) => f.playoffTieId === def.id || (
+      ((f.home === def.teamHigher.id && f.away === def.teamLower.id) || (f.home === def.teamLower.id && f.away === def.teamHigher.id))
+    )).sort((a: any, b: any) => (a.playoffLeg || 1) - (b.playoffLeg || 1) || (a.date + a.time).localeCompare(b.date + b.time));
+
+    const leg1 = fxList[0];
+    const leg2 = fxList[1];
+    const isDone = def.twoLegged ? (!!leg1 && !!leg2 && leg1.status === 'done' && leg2.status === 'done') : (!!leg1 && leg1.status === 'done');
+
+    let scoreText = '—';
+    let winnerId: string | null = null;
+    let winnerName: string | null = null;
+    let winnerNote = '';
+
+    if (def.twoLegged) {
+      if (leg1 && leg2 && leg1.status === 'done' && leg2.status === 'done') {
+        const isLeg1LowerHome = leg1.home === def.teamLower.id;
+        const lowerLeg1 = isLeg1LowerHome ? (leg1.hg ?? 0) : (leg1.ag ?? 0);
+        const higherLeg1 = isLeg1LowerHome ? (leg1.ag ?? 0) : (leg1.hg ?? 0);
+
+        const isLeg2HigherHome = leg2.home === def.teamHigher.id;
+        const higherLeg2 = isLeg2HigherHome ? (leg2.hg ?? 0) : (leg2.ag ?? 0);
+        const lowerLeg2 = isLeg2HigherHome ? (leg2.ag ?? 0) : (leg2.hg ?? 0);
+
+        const totalHigher = higherLeg1 + higherLeg2;
+        const totalLower = lowerLeg1 + lowerLeg2;
+
+        if (totalHigher > totalLower) {
+          winnerId = def.teamHigher.id;
+        } else if (totalLower > totalHigher) {
+          winnerId = def.teamLower.id;
+        } else {
+          if (!leg2.pen) leg2.pen = shootout(leg2);
+          const leg2HomeWon = leg2.pen.winner === 'home';
+          winnerId = isLeg2HigherHome ? (leg2HomeWon ? def.teamHigher.id : def.teamLower.id) : (leg2HomeWon ? def.teamLower.id : def.teamHigher.id);
+        }
+        winnerName = winnerId ? tn(winnerId) : '';
+        scoreText = `${leg1.hg}:${leg1.ag}, ${leg2.hg}:${leg2.ag} (по сумме ${totalHigher}:${totalLower}${leg2.pen ? `, пен. ${leg2.pen.hg}:${leg2.pen.ag}` : ''})`;
+        winnerNote = winnerId === def.teamLower.id ? `Победа ${winnerName} (выход в ${def.teamHigher.comp === 'rpl' ? 'РПЛ' : 'Первую лигу'})` : `Победа ${winnerName} (сохранение прописки)`;
+      } else if (leg1 && leg1.status === 'done') {
+        scoreText = `1-й матч: ${leg1.hg}:${leg1.ag} (ответный не сыгран)`;
+      }
+    } else {
+      if (leg1 && leg1.status === 'done') {
+        if ((leg1.hg ?? 0) > (leg1.ag ?? 0)) winnerId = leg1.home;
+        else if ((leg1.ag ?? 0) > (leg1.hg ?? 0)) winnerId = leg1.away;
+        else {
+          if (!leg1.pen) leg1.pen = shootout(leg1);
+          winnerId = leg1.pen.winner === 'home' ? leg1.home : leg1.away;
+        }
+        winnerName = winnerId ? tn(winnerId) : '';
+        scoreText = `${leg1.hg}:${leg1.ag}${leg1.pen ? ` (пен. ${leg1.pen.hg}:${leg1.pen.ag})` : ''}`;
+        winnerNote = `Победитель стыка: ${winnerName}`;
+      }
+    }
+
+    return {
+      ...def,
+      legs: fxList.map(pubFx),
+      isDone,
+      scoreText,
+      winnerId,
+      winnerName,
+      winnerNote
+    };
+  });
+
+  const totalRequired = tieDefs.reduce((acc, t) => acc + (t.twoLegged ? 2 : 1), 0);
+  const playedCount = allPlayoffFx.filter((f: any) => f.status === 'done').length;
+  const isCreated = allPlayoffFx.length >= totalRequired;
+  const allTiesDone = isCreated && ties.every(t => t.isDone);
+
+  return {
+    season,
+    ties,
+    playoffsCreated: isCreated,
+    playoffsTotal: totalRequired,
+    playoffsPlayed: playedCount,
+    playoffsAllPlayed: allTiesDone,
+    canRotate: allTiesDone
+  };
+}
+
+function generateSeasonPlayoffs(targetSeason?: string) {
+  const season = targetSeason || S();
+  const rplRows = table('rpl');
+  const fnlRows = table('fnl');
+  const goldRows = table('2la_gold');
+  const mediaRows = table('media');
+
+  const rpl13 = rplRows[12] || { id: 'rubin', name: 'Рубин' };
+  const rpl14 = rplRows[13] || { id: 'fakel', name: 'Факел' };
+  const fnl3 = fnlRows[2] || { id: 'volga-ulyanovsk', name: 'Волга Ульяновск' };
+  const fnl4 = fnlRows[3] || { id: 'yenisey', name: 'Енисей' };
+  const fnl16 = fnlRows[15] || { id: 'sokol', name: 'Сокол' };
+  const gold3 = goldRows[2] || { id: 'mashuk-kmv', name: 'Машук-КМВ' };
+  const media5 = mediaRows[4] || { id: '2drots', name: '2Drots' };
+  const media6 = mediaRows[5] || { id: 'brokeboys', name: 'Броуки (Brokeboys)' };
+  const media7 = mediaRows[6] || { id: 'amkal', name: 'Амкал' };
+  const media8 = mediaRows[7] || { id: 'lit_energy', name: 'Lit Energy' };
+
+  // Удаляем старые стыковые матчи этого сезона
+  db.fixtures = db.fixtures.filter((f: any) => !(f.season === season && (f.comp === 'playoff' || f.comp === 'playoff_rpl_fnl')));
+
+  const sFx = seasonFx();
+  let latestDate = sFx.reduce((max: string, f: any) => (f.date && f.date > max ? f.date : max), '2027-05-24');
+  const leg1Date = addDays(latestDate, 3);
+  const leg2Date = addDays(latestDate, 7);
+
+  const newFixtures: any[] = [
+    // 1. RPL 13 vs FNL 4
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'rpl_fnl_1', playoffLeg: 1, round: 1,
+      label: 'Стык: РПЛ — 1-я лига (1-й матч)', date: leg1Date, time: '17:00',
+      home: fnl4.id, away: rpl13.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    },
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'rpl_fnl_1', playoffLeg: 2, round: 2,
+      label: 'Стык: РПЛ — 1-я лига (Ответный матч)', date: leg2Date, time: '19:30',
+      home: rpl13.id, away: fnl4.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    },
+    // 2. RPL 14 vs FNL 3
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'rpl_fnl_2', playoffLeg: 1, round: 1,
+      label: 'Стык: РПЛ — 1-я лига (1-й матч)', date: leg1Date, time: '19:15',
+      home: fnl3.id, away: rpl14.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    },
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'rpl_fnl_2', playoffLeg: 2, round: 2,
+      label: 'Стык: РПЛ — 1-я лига (Ответный матч)', date: leg2Date, time: '17:00',
+      home: rpl14.id, away: fnl3.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    },
+    // 3. FNL 16 vs 2LA Gold 3
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'fnl_gold_1', playoffLeg: 1, round: 1,
+      label: 'Стык: 1-я лига — 2-я лига А (1-й матч)', date: leg1Date, time: '14:30',
+      home: gold3.id, away: fnl16.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    },
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'fnl_gold_1', playoffLeg: 2, round: 2,
+      label: 'Стык: 1-я лига — 2-я лига А (Ответный матч)', date: leg2Date, time: '15:00',
+      home: fnl16.id, away: gold3.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    },
+    // 4. Media play-in 1 (5 vs 8)
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'media_playin_1', playoffLeg: 1, round: 1,
+      label: 'Стык MFL: Плей-ин (5-е vs 8-е)', date: leg1Date, time: '13:00',
+      home: media5.id, away: media8.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    },
+    // 5. Media play-in 2 (6 vs 7)
+    {
+      id: uid(), season, comp: 'playoff', playoffTieId: 'media_playin_2', playoffLeg: 1, round: 1,
+      label: 'Стык MFL: Плей-ин (6-е vs 7-е)', date: leg1Date, time: '15:30',
+      home: media6.id, away: media7.id, status: 'scheduled', hg: null, ag: null, pos: 0
+    }
+  ];
+
+  newFixtures.forEach(f => {
+    assignReferee(f);
+    assignFixtureWeather(f);
+    db.fixtures.push(f);
+  });
+
+  ensureDualTimes(season, false);
+  invalidateAgg();
+  save();
+
+  return { ok: 1, created: newFixtures.length, playoffs: getSeasonPlayoffs(season) };
+}
+
+function performSeasonRotation(customNextSeason?: string, customStartDate?: string, force = false) {
   const currentSeason = S();
+  const pl = getSeasonPlayoffs(currentSeason);
+
+  if (!force) {
+    if (!pl.playoffsCreated) {
+      throw new Error('Стыковые матчи еще не созданы! Сначала нажмите «Создать переходные матчи».');
+    }
+    if (!pl.playoffsAllPlayed) {
+      throw new Error(`Не все стыковые матчи сыграны (сыграно ${pl.playoffsPlayed} из ${pl.playoffsTotal})! Сыграйте все переходные матчи во всех лигах перед переходом к новому сезону.`);
+    }
+  }
+
   const [y1, y2] = currentSeason.split('/');
-  const nextSeason = `${+y1 + 1}/${(+y2 + 1) % 100}`;
+  const defaultNextSeason = `${+y1 + 1}/${(+y2 + 1) % 100}`;
+  const nextSeason = customNextSeason || defaultNextSeason;
 
   const rplRows = table('rpl');
   const fnlRows = table('fnl');
@@ -2070,7 +3616,8 @@ function performSeasonRotation() {
   const report: {
     promotions: { team: string; from: string; to: string; reason: string }[];
     relegations: { team: string; from: string; to: string; reason: string }[];
-    playoffs: { match: string; score: string; winner: string }[];
+    playoffs: { match: string; score: string; winner: string; note?: string }[];
+    supercup?: { home: string; away: string; match: string; reason: string };
   } = {
     promotions: [],
     relegations: [],
@@ -2100,36 +3647,37 @@ function performSeasonRotation() {
     );
   }
 
-  // Переходные стыковые матчи РПЛ / Первой лиги
-  if (rplRows.length >= 14 && fnlRows.length >= 4) {
-    const rpl13 = rplRows[12], fnl4 = fnlRows[3];
-    const rpl14 = rplRows[13], fnl3 = fnlRows[2];
-
-    const win13 = (rpl13.pts || 0) >= (fnl4.pts || 0) ? rpl13 : fnl4;
-    report.playoffs.push({
-      match: `Стык: ${rpl13.name} (13-е РПЛ) — ${fnl4.name} (4-е ФНЛ)`,
-      score: win13.id === rpl13.id ? '2:1 (по сумме 2 матчей)' : '1:2 (по сумме 2 матчей)',
-      winner: win13.name
-    });
-    if (win13.id === fnl4.id) {
-      fnlPromotedIds.push(fnl4.id);
-      rplRelegatedIds.push(rpl13.id);
-      report.promotions.push({ team: fnl4.name, from: 'Первая лига', to: 'РПЛ', reason: 'Победа в стыках' });
-      report.relegations.push({ team: rpl13.name, from: 'РПЛ', to: 'Первая лига', reason: 'Поражение в стыках' });
+  // Переходные стыковые матчи РПЛ / Первой лиги (на основе реальных сыгранных матчей!)
+  const tieRplFnl1 = pl.ties.find((t: any) => t.id === 'rpl_fnl_1');
+  if (tieRplFnl1) {
+    if (tieRplFnl1.winnerId === tieRplFnl1.teamLower.id) {
+      fnlPromotedIds.push(tieRplFnl1.teamLower.id);
+      rplRelegatedIds.push(tieRplFnl1.teamHigher.id);
+      report.promotions.push({ team: tieRplFnl1.teamLower.name, from: 'Первая лига', to: 'РПЛ', reason: `Победа в стыках над ${tieRplFnl1.teamHigher.name} (${tieRplFnl1.scoreText})` });
+      report.relegations.push({ team: tieRplFnl1.teamHigher.name, from: 'РПЛ', to: 'Первая лига', reason: `Поражение в стыках от ${tieRplFnl1.teamLower.name} (${tieRplFnl1.scoreText})` });
     }
-
-    const win14 = (rpl14.pts || 0) >= (fnl3.pts || 0) ? rpl14 : fnl3;
     report.playoffs.push({
-      match: `Стык: ${rpl14.name} (14-е РПЛ) — ${fnl3.name} (3-е ФНЛ)`,
-      score: win14.id === rpl14.id ? '3:2 (по сумме 2 матчей)' : '0:2 (по сумме 2 матчей)',
-      winner: win14.name
+      match: tieRplFnl1.title,
+      score: tieRplFnl1.scoreText,
+      winner: tieRplFnl1.winnerName || tieRplFnl1.teamHigher.name,
+      note: tieRplFnl1.winnerNote
     });
-    if (win14.id === fnl3.id) {
-      fnlPromotedIds.push(fnl3.id);
-      rplRelegatedIds.push(rpl14.id);
-      report.promotions.push({ team: fnl3.name, from: 'Первая лига', to: 'РПЛ', reason: 'Победа в стыках' });
-      report.relegations.push({ team: rpl14.name, from: 'РПЛ', to: 'Первая лига', reason: 'Поражение в стыках' });
+  }
+
+  const tieRplFnl2 = pl.ties.find((t: any) => t.id === 'rpl_fnl_2');
+  if (tieRplFnl2) {
+    if (tieRplFnl2.winnerId === tieRplFnl2.teamLower.id) {
+      fnlPromotedIds.push(tieRplFnl2.teamLower.id);
+      rplRelegatedIds.push(tieRplFnl2.teamHigher.id);
+      report.promotions.push({ team: tieRplFnl2.teamLower.name, from: 'Первая лига', to: 'РПЛ', reason: `Победа в стыках над ${tieRplFnl2.teamHigher.name} (${tieRplFnl2.scoreText})` });
+      report.relegations.push({ team: tieRplFnl2.teamHigher.name, from: 'РПЛ', to: 'Первая лига', reason: `Поражение в стыках от ${tieRplFnl2.teamLower.name} (${tieRplFnl2.scoreText})` });
     }
+    report.playoffs.push({
+      match: tieRplFnl2.title,
+      score: tieRplFnl2.scoreText,
+      winner: tieRplFnl2.winnerName || tieRplFnl2.teamHigher.name,
+      note: tieRplFnl2.winnerNote
+    });
   }
 
   // Ротация: Первая лига ⇄ 2-я лига «А» «Золото»
@@ -2150,6 +3698,34 @@ function performSeasonRotation() {
       { team: g1.name, from: '2-я лига «А» Золото', to: 'Первая лига', reason: '1-е место (прямой выход)' },
       { team: g2.name, from: '2-я лига «А» Золото', to: 'Первая лига', reason: '2-е место (прямой выход)' }
     );
+  }
+
+  // Стык: 16-е место Первой лиги ⇄ 3-е место 2-й лиги «А» «Золото»
+  const tieFnlGold = pl.ties.find((t: any) => t.id === 'fnl_gold_1');
+  if (tieFnlGold) {
+    if (tieFnlGold.winnerId === tieFnlGold.teamLower.id) {
+      goldPromotedIds.push(tieFnlGold.teamLower.id);
+      fnlRelegatedIds.push(tieFnlGold.teamHigher.id);
+      report.promotions.push({ team: tieFnlGold.teamLower.name, from: '2-я лига «А» Золото', to: 'Первая лига', reason: `Победа в стыках над ${tieFnlGold.teamHigher.name} (${tieFnlGold.scoreText})` });
+      report.relegations.push({ team: tieFnlGold.teamHigher.name, from: 'Первая лига', to: '2-я лига «А» Золото', reason: `Поражение в стыках от ${tieFnlGold.teamLower.name} (${tieFnlGold.scoreText})` });
+    }
+    report.playoffs.push({
+      match: tieFnlGold.title,
+      score: tieFnlGold.scoreText,
+      winner: tieFnlGold.winnerName || tieFnlGold.teamHigher.name,
+      note: tieFnlGold.winnerNote
+    });
+  }
+
+  // Стыки Медиалиги (плей-ин)
+  const mediaTies = pl.ties.filter((t: any) => t.id.startsWith('media'));
+  for (const mt of mediaTies) {
+    report.playoffs.push({
+      match: mt.title,
+      score: mt.scoreText,
+      winner: mt.winnerName || 'Не определён',
+      note: mt.winnerNote
+    });
   }
 
   // Полугодичная ротация: Золото ⇄ Серебро (4 худших ⇄ 4 лучших)
@@ -2197,10 +3773,63 @@ function performSeasonRotation() {
     else if (bUpIds.includes(t.id)) t.comp = '2la_silver';
   }
 
-  genSeason('2027-07-20', nextSeason);
+  const nextStartYear = parseInt(nextSeason.slice(0, 4), 10) || (+y1 + 1);
+  const startDate = customStartDate || `${nextStartYear}-07-20`;
+  genSeason(startDate, nextSeason);
+  ensureDualTimes(nextSeason, true);
+  db.settings.season = nextSeason;
+  invalidateAgg();
   save();
 
-  return { ok: 1, currentSeason, nextSeason, report };
+  const scInfo = determineSuperCupTeams(nextSeason);
+  report.supercup = {
+    home: scInfo.homeName,
+    away: scInfo.awayName,
+    match: `${scInfo.homeName} — ${scInfo.awayName}`,
+    reason: scInfo.reason
+  };
+
+  return { ok: 1, currentSeason, nextSeason, startDate, report };
+}
+
+function getSeasonRotationPreview() {
+  const currentSeason = S();
+  const [y1, y2] = currentSeason.split('/');
+  const nextSeason = `${+y1 + 1}/${(+y2 + 1) % 100}`;
+  const nextStartYear = parseInt(nextSeason.slice(0, 4), 10) || (+y1 + 1);
+  const defaultStartDate = `${nextStartYear}-07-20`;
+
+  const rplRows = table('rpl');
+  const fnlRows = table('fnl');
+
+  const rpl15 = rplRows[14] || { name: 'ЦСКА', pts: 0 };
+  const rpl16 = rplRows[15] || { name: 'Акрон', pts: 0 };
+  const fnl1 = fnlRows[0] || { name: 'Арсенал Тула', pts: 0 };
+  const fnl2 = fnlRows[1] || { name: 'Велес', pts: 0 };
+
+  const pl = getSeasonPlayoffs(currentSeason);
+  const scInfo = determineSuperCupTeams(nextSeason);
+
+  return {
+    currentSeason,
+    nextSeason,
+    defaultStartDate,
+    relegations: [
+      { name: rpl15.name, place: 15, pts: rpl15.pts || 0 },
+      { name: rpl16.name, place: 16, pts: rpl16.pts || 0 }
+    ],
+    promotions: [
+      { name: fnl1.name, place: 1, pts: fnl1.pts || 0 },
+      { name: fnl2.name, place: 2, pts: fnl2.pts || 0 }
+    ],
+    playoffs: pl.ties,
+    playoffsCreated: pl.playoffsCreated,
+    playoffsTotal: pl.playoffsTotal,
+    playoffsPlayed: pl.playoffsPlayed,
+    playoffsAllPlayed: pl.playoffsAllPlayed,
+    canRotate: pl.canRotate,
+    supercup: scInfo
+  };
 }
 
 /* ───────── HTTP и API ───────── */
@@ -2271,7 +3900,9 @@ const pubTeam = (t: any) => {
     colors: getTeamColors(t.name),
     coach,
     synergy,
-    staff
+    staff,
+    budget: t.budget || 0,
+    formattedBudget: '€' + (t.budget || 0).toLocaleString('ru-RU')
   };
 };
 
@@ -2294,44 +3925,91 @@ const pubPlayer = (p: any) => ({
   banLeft: p.banLeft
 });
 
-const pubFx = (f: any) => ({
-  id: f.id,
-  comp: f.comp,
-  cupPath: f.cupPath || (f.comp === 'cup' ? (f.round <= 6 ? 'rpl_group' : 'regions_qual') : null),
-  groupId: f.groupId || null,
-  qualRound: f.qualRound || null,
-  cupStage: f.cupStage || null,
-  round: f.round,
-  label: roundLabel(f),
-  date: f.date,
-  time: f.time,
-  home: f.home,
-  away: f.away,
-  homeName: tn(f.home),
-  awayName: tn(f.away),
-  homeLogo: teamLogo(f.home),
-  awayLogo: teamLogo(f.away),
-  status: f.status,
-  hg: f.hg,
-  ag: f.ag,
-  pen: f.pen || null,
-  full: f.status === 'live' || f.status === 'done' ? !!f.st || f.status === 'live' : fullSim(f),
-  derby: !!db.derbies.find((d: any) => (d.a === f.home && d.b === f.away) || (d.a === f.away && d.b === f.home)),
-  refereeId: (f.comp === 'rpl' || f.comp === 'cup') ? (f.refereeId || null) : null,
-  refereeName: (f.comp === 'rpl' || f.comp === 'cup') ? (f.refereeName || null) : null,
-  assistants: (f.comp === 'rpl' || f.comp === 'cup') ? (f.assistants || []) : [],
-  reserveReferee: (f.comp === 'rpl' || f.comp === 'cup') ? (f.reserveReferee || null) : null,
-  varReferee: (f.comp === 'rpl' || f.comp === 'cup') ? (f.varReferee || null) : null,
-  avarReferee: (f.comp === 'rpl' || f.comp === 'cup') ? (f.avarReferee || null) : null
-});
+const pubFx = (f: any) => {
+  const isFinal = isFinalMatch(f);
+  let stadium = f.stadium;
+  let city = f.city;
+  let neutralField = !!f.neutralField;
+
+  if (isFinal) {
+    neutralField = true;
+    if (f.comp === 'cup') {
+      stadium = 'БСА «Лужники» (нейтральное поле, г. Москва)';
+      city = 'Москва';
+    } else if (f.comp === 'supercup') {
+      if (f.season === '2026/27' || String(f.date || '').startsWith('2026')) {
+        stadium = 'Стадион «Нижний Новгород» (нейтральное поле, г. Нижний Новгород)';
+        city = 'Нижний Новгород';
+      } else if (!stadium || !stadium.includes('нейтральное')) {
+        const v = getSuperCupVenue(f.season || S());
+        stadium = v.stadium;
+        city = v.city;
+      }
+    } else {
+      if (!stadium) {
+        stadium = (f.home ? team(f.home)?.stadium : '') ? `${team(f.home)?.stadium} (нейтральное поле)` : 'Нейтральное поле';
+      } else if (!stadium.includes('нейтральное')) {
+        stadium = `${stadium} (нейтральное поле)`;
+      }
+    }
+  } else {
+    stadium = stadium || (f.home ? team(f.home)?.stadium : null);
+    city = city || (f.home ? team(f.home)?.city : null);
+  }
+
+  return {
+    id: f.id,
+    comp: f.comp,
+    season: f.season || S(),
+    cupPath: f.cupPath || (f.comp === 'cup' ? (f.round <= 6 ? 'rpl_group' : 'regions_qual') : null),
+    groupId: f.groupId || null,
+    qualRound: f.qualRound || null,
+    cupStage: f.cupStage || null,
+    playoffTieId: f.playoffTieId || null,
+    playoffLeg: f.playoffLeg || null,
+    round: f.round,
+    label: roundLabel(f),
+    date: f.date,
+    time: f.time,
+    gameDate: f.gameDate || f.date,
+    gameTime: f.gameTime || f.time,
+    realDate: f.realDate || f.date,
+    realTime: f.realTime || f.time,
+    home: f.home,
+    away: f.away,
+    homeName: tn(f.home),
+    awayName: tn(f.away),
+    homeLogo: teamLogo(f.home),
+    awayLogo: teamLogo(f.away),
+    status: f.status,
+    hg: f.hg,
+    ag: f.ag,
+    pen: f.pen || null,
+    full: f.status === 'live' || f.status === 'done' ? !!f.st || f.status === 'live' : fullSim(f),
+    derby: !!db.derbies.find((d: any) => (d.a === f.home && d.b === f.away) || (d.a === f.away && d.b === f.home)),
+    refereeId: (f.comp === 'rpl' || f.comp === 'cup') ? (f.refereeId || null) : null,
+    refereeName: (f.comp === 'rpl' || f.comp === 'cup') ? (f.refereeName || null) : null,
+    assistants: (f.comp === 'rpl' || f.comp === 'cup') ? (f.assistants || []) : [],
+    reserveReferee: (f.comp === 'rpl' || f.comp === 'cup') ? (f.reserveReferee || null) : null,
+    varReferee: (f.comp === 'rpl' || f.comp === 'cup') ? (f.varReferee || null) : null,
+    avarReferee: (f.comp === 'rpl' || f.comp === 'cup') ? (f.avarReferee || null) : null,
+    stadium,
+    city,
+    neutralField,
+    weather: f.weather || null,
+    weatherShort: f.weatherShort || null,
+    weatherDetails: f.weatherDetails || null
+  };
+};
 
 app.post('/api/login', (req, res) => {
-  const c = String(req.body.code || '').trim().toUpperCase();
+  const c = codeKey(req.body.code);
   if (!c) return fail(res, 'Введите код');
+  ensureTeamCodes();
   let s: any = null;
-  if (c === String(process.env.ADMIN_CODE || db.settings.adminCode).toUpperCase()) s = { role: 'admin' };
+  if (c === codeKey(process.env.ADMIN_CODE || db.settings.adminCode)) s = { role: 'admin' };
   else {
-    const t = db.teams.find((t: any) => t.code && t.code.toUpperCase() === c);
+    const t = db.teams.find((t: any) => t.code && codeKey(t.code) === c);
     if (t) s = { role: 'club', teamId: t.id };
   }
   if (!s) return fail(res, 'Код не найден', 401);
@@ -2351,6 +4029,10 @@ app.post('/api/logout', (req, res) => {
 app.get('/api/state', (req: any, res) => {
   res.json({
     season: S(),
+    seasons: getAvailableSeasons(),
+    realStartDate: db.settings.realStartDate || new Date().toISOString().slice(0, 10),
+    timeMode: db.settings.timeMode || 'game',
+    auto: !!db.settings.auto,
     legionLimit: getRplLegionLimit(S()),
     comps: db.comps,
     teams: db.teams.map(pubTeam),
@@ -2369,6 +4051,76 @@ app.get('/api/regulations/:comp', (req, res) => {
 
 app.get('/api/table/:comp', (req, res) => res.json(table(req.params.comp)));
 
+app.get('/api/weather/cities', (req, res) => {
+  const cities = Object.values(db.cityClimates || CLIMATE_DATA).map((c: any) => ({
+    city: c.city,
+    region: c.region,
+    lat: c.lat,
+    lon: c.lon,
+    months: c.months
+  }));
+  res.json(cities);
+});
+
+app.get('/api/weather/city/:cityName', (req, res) => {
+  const cityName = req.params.cityName;
+  const dateStr = String(req.query.date || new Date().toISOString().slice(0, 10));
+  const timeStr = String(req.query.time || '17:00');
+  const w = calculateMatchWeather(cityName, dateStr, timeStr);
+  res.json(w);
+});
+
+app.get('/api/transfers/top', (req, res) => {
+  const approved = (db.transfers || []).filter((t: any) => t.status === 'approved');
+
+  // Самые дорогие (по сумме сделки)
+  const expensive = [...approved].sort((a: any, b: any) => {
+    const amtA = a.feeAmount !== undefined ? a.feeAmount : parseFeeAmount(a.fee);
+    const amtB = b.feeAmount !== undefined ? b.feeAmount : parseFeeAmount(b.fee);
+    return amtB - amtA;
+  }).slice(0, 10);
+
+  // Самые выгодные (по вкладу и пользе для нового клуба)
+  const valuable = [...approved].sort((a: any, b: any) => {
+    const pA = player(a.pid);
+    const pB = player(b.pid);
+    const scoreA = a.statsForNewClub?.impactScore !== undefined
+      ? a.statsForNewClub.impactScore
+      : (((pA?.goals || 0) * 4 + (pA?.assists || 0) * 2.5 + (pA?.matches || 0) * 1.2));
+    const scoreB = b.statsForNewClub?.impactScore !== undefined
+      ? b.statsForNewClub.impactScore
+      : (((pB?.goals || 0) * 4 + (pB?.assists || 0) * 2.5 + (pB?.matches || 0) * 1.2));
+    return scoreB - scoreA;
+  }).slice(0, 10);
+
+  // Самые провальные (большая переплата и нет результативности)
+  const flops = [...approved].filter((t: any) => {
+    const amt = t.feeAmount !== undefined ? t.feeAmount : parseFeeAmount(t.fee);
+    return amt > 0;
+  }).sort((a: any, b: any) => {
+    const amtA = a.feeAmount !== undefined ? a.feeAmount : parseFeeAmount(a.fee);
+    const amtB = b.feeAmount !== undefined ? b.feeAmount : parseFeeAmount(b.fee);
+    const pA = player(a.pid);
+    const pB = player(b.pid);
+    const impactA = a.statsForNewClub?.impactScore !== undefined
+      ? a.statsForNewClub.impactScore
+      : (((pA?.goals || 0) * 3 + (pA?.assists || 0) * 2 + (pA?.matches || 0) * 0.5 + Math.max(0, (pA?.rating || 6.5) - 6.0)));
+    const impactB = b.statsForNewClub?.impactScore !== undefined
+      ? b.statsForNewClub.impactScore
+      : (((pB?.goals || 0) * 3 + (pB?.assists || 0) * 2 + (pB?.matches || 0) * 0.5 + Math.max(0, (pB?.rating || 6.5) - 6.0)));
+    const flopScoreA = amtA / Math.max(0.1, impactA + 0.1);
+    const flopScoreB = amtB / Math.max(0.1, impactB + 0.1);
+    return flopScoreB - flopScoreA;
+  }).slice(0, 10);
+
+  res.json({
+    expensive: expensive.map(formatTransferForPublic),
+    valuable: valuable.map(formatTransferForPublic),
+    flops: flops.map(formatTransferForPublic),
+    totalCount: approved.length
+  });
+});
+
 app.get('/api/fixtures', (req, res) => {
   let l = seasonFx();
   if (req.query.comp) l = l.filter((f: any) => f.comp === req.query.comp);
@@ -2376,6 +4128,168 @@ app.get('/api/fixtures', (req, res) => {
   l = l.sort((a: any, b: any) => (a.date + a.time).localeCompare(b.date + b.time));
   res.json(l.map(pubFx));
 });
+
+function getHeadToHead(homeTid: string, awayTid: string, currentFixtureId?: string) {
+  const H = team(homeTid);
+  const A = team(awayTid);
+  const hName = H?.name || tn(homeTid);
+  const aName = A?.name || tn(awayTid);
+  const hLogo = teamLogo(homeTid);
+  const aLogo = teamLogo(awayTid);
+
+  // 1. Собрать реально сыгранные матчи из базы данных между этими двумя командами
+  const realPlayed = (db.fixtures || []).filter((f: any) => {
+    if (currentFixtureId && f.id === currentFixtureId) return false;
+    if (f.status !== 'done') return false;
+    return (f.home === homeTid && f.away === awayTid) || (f.home === awayTid && f.away === homeTid);
+  }).sort((a: any, b: any) => ((b.date || '') + (b.time || '')).localeCompare((a.date || '') + (a.time || '')));
+
+  const matches: any[] = [];
+  for (const f of realPlayed) {
+    const isDirectHome = f.home === homeTid;
+    const hg = f.hg ?? 0;
+    const ag = f.ag ?? 0;
+    const homeGoals = isDirectHome ? hg : ag;
+    const awayGoals = isDirectHome ? ag : hg;
+    let outcome: 'home' | 'away' | 'draw' = 'draw';
+    if (homeGoals > awayGoals) outcome = 'home';
+    else if (awayGoals > homeGoals) outcome = 'away';
+
+    matches.push({
+      id: f.id,
+      date: f.date || '2026-08-10',
+      time: f.time || '18:00',
+      comp: compName(f) || 'РПЛ',
+      round: roundLabel(f) || '',
+      homeId: f.home,
+      awayId: f.away,
+      homeName: tn(f.home),
+      awayName: tn(f.away),
+      homeLogo: teamLogo(f.home),
+      awayLogo: teamLogo(f.away),
+      homeGoals: hg,
+      awayGoals: ag,
+      score: `${hg} : ${ag}`,
+      penalties: f.penalties ? `${f.penalties.home} : ${f.penalties.away} пен.` : undefined,
+      outcome, // относительно текущей пары (homeTid против awayTid)
+      winnerId: hg > ag ? f.home : (ag > hg ? f.away : null),
+      stadium: team(f.home)?.stadium || '',
+      isSimulated: true
+    });
+    if (matches.length >= 10) break;
+  }
+
+  // 2. Если сыграно меньше 10 матчей в симуляторе, дополняем детерминированной исторической статистикой встреч
+  if (matches.length < 10) {
+    const need = 10 - matches.length;
+    let seedVal = 0;
+    for (let i = 0; i < (homeTid + awayTid).length; i++) {
+      seedVal = (seedVal * 31 + (homeTid + awayTid).charCodeAt(i)) & 0xffffff;
+    }
+
+    const pseudoRandom = (step: number) => {
+      const x = Math.sin(seedVal + step * 7919) * 10000;
+      return x - Math.floor(x);
+    };
+
+    const comps = ['РПЛ', 'РПЛ', 'РПЛ', 'Кубок России', 'РПЛ', 'РПЛ', 'Кубок России', 'Суперкубок'];
+    const years = [2026, 2025, 2025, 2024, 2024, 2023, 2023, 2022, 2022, 2021];
+    const months = ['03', '05', '08', '09', '10', '11', '04', '07', '12', '06'];
+    const days = ['12', '24', '18', '03', '29', '15', '07', '21', '30', '14'];
+
+    for (let i = 0; i < need; i++) {
+      const idx = matches.length;
+      const r1 = pseudoRandom(idx * 3 + 1);
+      const r2 = pseudoRandom(idx * 3 + 2);
+      const r3 = pseudoRandom(idx * 3 + 3);
+
+      const altHome = idx % 2 === 0;
+      const currentHomeId = altHome ? homeTid : awayTid;
+      const currentAwayId = altHome ? awayTid : homeTid;
+
+      // Сгенерируем реалистичный футбольный счет
+      let hScore = 0;
+      let aScore = 0;
+      if (r1 < 0.28) {
+        // Ничья
+        hScore = r2 < 0.5 ? 1 : (r2 < 0.85 ? 0 : 2);
+        aScore = hScore;
+      } else if (r1 < 0.65) {
+        // Победа хозяев
+        hScore = r2 < 0.4 ? 1 : (r2 < 0.8 ? 2 : 3);
+        aScore = r3 < 0.5 ? 0 : 1;
+        if (hScore <= aScore) hScore = aScore + 1;
+      } else {
+        // Победа гостей
+        aScore = r2 < 0.45 ? 1 : (r2 < 0.85 ? 2 : 3);
+        hScore = r3 < 0.6 ? 0 : 1;
+        if (aScore <= hScore) aScore = hScore + 1;
+      }
+
+      const isDirectHome = currentHomeId === homeTid;
+      const hgRel = isDirectHome ? hScore : aScore;
+      const agRel = isDirectHome ? aScore : hScore;
+      let outcome: 'home' | 'away' | 'draw' = 'draw';
+      if (hgRel > agRel) outcome = 'home';
+      else if (agRel > hgRel) outcome = 'away';
+
+      const yr = years[idx % years.length];
+      const mo = months[idx % months.length];
+      const dy = days[idx % days.length];
+
+      matches.push({
+        id: `hist_${homeTid}_${awayTid}_${idx}`,
+        date: `${yr}-${mo}-${dy}`,
+        time: '19:00',
+        comp: comps[idx % comps.length],
+        round: comps[idx % comps.length].includes('Кубок') ? '1/4 финала' : `${(idx % 25) + 1} тур`,
+        homeId: currentHomeId,
+        awayId: currentAwayId,
+        homeName: tn(currentHomeId),
+        awayName: tn(currentAwayId),
+        homeLogo: teamLogo(currentHomeId),
+        awayLogo: teamLogo(currentAwayId),
+        homeGoals: hScore,
+        awayGoals: aScore,
+        score: `${hScore} : ${aScore}`,
+        outcome,
+        winnerId: hScore > aScore ? currentHomeId : (aScore > hScore ? currentAwayId : null),
+        stadium: team(currentHomeId)?.stadium || '',
+        isSimulated: false
+      });
+    }
+  }
+
+  // 3. Подсчет итоговой статистики по 10 встречам
+  let homeWins = 0, draws = 0, awayWins = 0, homeGoalsTotal = 0, awayGoalsTotal = 0;
+  for (const m of matches) {
+    if (m.outcome === 'home') homeWins++;
+    else if (m.outcome === 'away') awayWins++;
+    else draws++;
+
+    if (m.homeId === homeTid) {
+      homeGoalsTotal += m.homeGoals;
+      awayGoalsTotal += m.awayGoals;
+    } else {
+      homeGoalsTotal += m.awayGoals;
+      awayGoalsTotal += m.homeGoals;
+    }
+  }
+
+  return {
+    homeTeam: { id: homeTid, name: hName, logo: hLogo },
+    awayTeam: { id: awayTid, name: aName, logo: aLogo },
+    stats: {
+      total: matches.length,
+      homeWins,
+      draws,
+      awayWins,
+      homeGoals: homeGoalsTotal,
+      awayGoals: awayGoalsTotal
+    },
+    matches
+  };
+}
 
 app.get('/api/match/:id', (req: any, res) => {
   const f = fx(req.params.id);
@@ -2429,7 +4343,8 @@ app.get('/api/match/:id', (req: any, res) => {
     coaches: {
       home: { coach: coachHome, synergy: computeCoachSynergy(coachHome, db.tactics[f.home]) },
       away: { coach: coachAway, synergy: computeCoachSynergy(coachAway, db.tactics[f.away]) }
-    }
+    },
+    h2h: getHeadToHead(f.home, f.away, f.id)
   };
   if (m && (f.status === 'live' || f.status === 'done')) {
     out.events = f.status === 'live' ? m.events.slice(0, f.pos) : m.events;
@@ -2459,7 +4374,8 @@ app.get('/api/match/:id', (req: any, res) => {
         comp: m.ctx.comp,
         roundLabel: m.ctx.roundLabel,
         stadium: m.ctx.stadium,
-        weather: m.ctx.weather,
+        weather: m.ctx.weather || f.weather,
+        weatherDetails: f.weatherDetails || null,
         derby: m.ctx.derby,
         motiv: m.ctx.motiv
       };
@@ -2475,11 +4391,17 @@ app.get('/api/match/:id', (req: any, res) => {
   if (!out.ctx) {
     const H = team(f.home);
     const dv = db.derbies.find((d: any) => (d.a === f.home && d.b === f.away) || (d.a === f.away && d.b === f.home));
+    const matchCity = f.city || H?.city || 'Москва';
+    const matchDate = f.gameDate || f.date || '2026-09-15';
+    const matchTime = f.gameTime || f.time || '17:00';
+    const w = f.weather ? { text: f.weather, short: f.weatherShort, ...f.weatherDetails } : calculateMatchWeather(matchCity, matchDate, matchTime);
+
     out.ctx = {
       comp: compName(f),
       roundLabel: roundLabel(f),
       stadium: (H?.stadium ? H.stadium + ', ' : '') + (H?.city || ''),
-      weather: 'Прогноз погоды формируется ближе к матчу',
+      weather: f.weather || w.text,
+      weatherDetails: f.weatherDetails || w,
       derby: dv ? `${dv.name}. ${dv.note}` : 'нет',
       motiv: { home: motivText(f.home, f), away: motivText(f.away, f) }
     };
@@ -2543,6 +4465,10 @@ app.post('/api/match/:id/interview', async (req: any, res) => {
 // Кубок России 2026/2027: структура, группы Пути РПЛ, Путь регионов и плей-офф
 app.get('/api/cup/structure', (req, res) => {
   if (!db.cupState2026) advanceCup();
+  if (db.cupState2026 && !db.cupState2026.finalVenue) {
+    db.cupState2026.finalVenue = CUP_FINAL_VENUE;
+    save();
+  }
   recalculateCupGroups(db.cupState2026, seasonFx());
   const cupMatches = seasonFx().filter((f: any) => f.comp === 'cup').map(pubFx);
   res.json({
@@ -2681,9 +4607,102 @@ app.get('/api/awards/season', (req, res) => {
   });
 });
 
+app.get('/api/season/rotation-preview', (req, res) => {
+  res.json(getSeasonRotationPreview());
+});
+
+app.post('/api/admin/playoffs/generate', admin, (req, res) => {
+  try {
+    const result = generateSeasonPlayoffs(S());
+    res.json(result);
+  } catch (e: any) {
+    fail(res, e.message);
+  }
+});
+
+app.post('/api/admin/playoffs/run-all', admin, (req, res) => {
+  try {
+    const scheduled = seasonFx().filter((f: any) => (f.comp === 'playoff' || f.comp === 'playoff_rpl_fnl') && f.status !== 'done');
+    if (!scheduled.length) {
+      return res.json({ ok: 1, ran: 0, message: 'Все стыковые матчи уже сыграны', playoffs: getSeasonPlayoffs(S()) });
+    }
+    // Remove from live queue if any were queued
+    for (const f of scheduled) {
+      const idx = queue.indexOf(f.id);
+      if (idx >= 0) queue.splice(idx, 1);
+    }
+    // Sort so Leg 1 is simulated before Leg 2
+    scheduled.sort((a: any, b: any) => (a.playoffLeg || 1) - (b.playoffLeg || 1) || a.date.localeCompare(b.date));
+
+    for (const f of scheduled) {
+      const r = rng(f.id + Date.now());
+      f.hg = poisson(1.45, r);
+      f.ag = poisson(1.1, r);
+      f.status = 'done';
+      f.st = null;
+      f.note = f.note || '';
+      checkPlayoffShootout(f);
+      const hSq = squadOf(f.home), aSq = squadOf(f.away);
+      const winSq = f.hg >= f.ag ? hSq : aSq;
+      const pMotm = winSq[0] || hSq[0];
+      if (pMotm) {
+        f.motm = { pid: pMotm.id, name: pMotm.name, rating: +(7.5 + (f.hg > f.ag ? 0.8 : 0.3)).toFixed(1) };
+      }
+    }
+    invalidateAgg();
+    save();
+
+    res.json({ ok: 1, ran: scheduled.length, playoffs: getSeasonPlayoffs(S()) });
+  } catch (e: any) {
+    fail(res, e.message);
+  }
+});
+
 app.post('/api/admin/season/rotate', admin, (req, res) => {
-  const result = performSeasonRotation();
-  res.json(result);
+  try {
+    const result = performSeasonRotation(req.body.nextSeason, req.body.startDate, !!req.body.force);
+    res.json(result);
+  } catch (e: any) {
+    fail(res, e.message);
+  }
+});
+
+app.post('/api/season/switch', (req: any, res) => {
+  const target = String(req.body.season || '').trim();
+  const doRotate = !!req.body.rotate || !!req.body.next;
+  
+  if (doRotate) {
+    try {
+      const customNext = req.body.nextSeason ? String(req.body.nextSeason).trim() : undefined;
+      const customStart = req.body.startDate ? String(req.body.startDate).trim() : undefined;
+      const result = performSeasonRotation(customNext, customStart, !!req.body.force);
+      return res.json({ season: S(), seasons: getAvailableSeasons(), ...result });
+    } catch (e: any) {
+      return fail(res, e.message);
+    }
+  }
+  
+  if (!target) return fail(res, 'Укажите сезон');
+  
+  db.settings.season = target;
+  const hasRpl = db.fixtures.some((f: any) => f.season === target && f.comp === 'rpl');
+  if (!hasRpl) {
+    const startYear = parseInt(target.slice(0, 4), 10) || 2026;
+    genSeason(`${startYear}-07-18`, target);
+  }
+  ensureDualTimes(target);
+  invalidateAgg();
+  save();
+  res.json({ ok: 1, season: S(), seasons: getAvailableSeasons() });
+});
+
+app.post('/api/admin/schedule/real-times', admin, (req, res) => {
+  if (req.body.realStartDate && /^\d{4}-\d{2}-\d{2}$/.test(req.body.realStartDate)) {
+    db.settings.realStartDate = req.body.realStartDate;
+  }
+  ensureDualTimes(S(), true);
+  save();
+  res.json({ ok: 1, realStartDate: db.settings.realStartDate, fixtures: seasonFx().length });
 });
 
 app.get('/api/live/:id', (req, res) => {
@@ -2713,13 +4732,31 @@ app.get('/api/leaders', (req, res) => {
     teamLogo: teamLogo(x.t),
     xg: +x.xg.toFixed(2)
   }));
-  const T = Object.values<any>(A.T).filter(x => x.comp === comp).map(x => ({
-    ...x,
-    team: tn(x.tid),
-    teamLogo: teamLogo(x.tid),
-    xg: +x.xg.toFixed(2),
-    xga: +x.xga.toFixed(2)
-  }));
+  const existingTeams = new Set<string>();
+  const T = Object.values<any>(A.T).filter(x => x.comp === comp).map(x => {
+    existingTeams.add(String(x.tid));
+    return {
+      ...x,
+      team: tn(x.tid),
+      teamLogo: teamLogo(x.tid),
+      xg: +x.xg.toFixed(2),
+      xga: +x.xga.toFixed(2)
+    };
+  });
+  const compTeams = db.teams.filter((t: any) => t.comp === comp);
+  for (const t of compTeams) {
+    if (!existingTeams.has(t.id)) {
+      T.push({
+        tid: t.id,
+        comp,
+        m: 0, g: 0, ga: 0, xg: 0, xga: 0, co: 0,
+        penF: 0, penA: 0, refF: 0, refA: 0, fo: 0, foA: 0,
+        yc: 0, rc: 0, tk: 0, sv: 0, cs: 0,
+        team: t.name,
+        teamLogo: teamLogo(t.id)
+      });
+    }
+  }
   res.json({ players: P, teams: T });
 });
 
@@ -2746,6 +4783,25 @@ app.get('/api/club', needClub, (req: any, res) => {
   const up = seasonFx().filter((f: any) => (f.home === req.tid || f.away === req.tid) && f.status === 'scheduled').sort((a: any, b: any) => (a.date + a.time).localeCompare(b.date + b.time)).slice(0, 6);
   const legionLimit = getRplLegionLimit(S());
   const legionSquadCount = sq.filter(isLegionnaire).length;
+  
+  const incoming = (db.transfers || []).filter((x: any) => x.from === req.tid && x.status === 'pending').map((x: any) => ({
+    ...x,
+    pName: player(x.pid)?.name || x.playerName,
+    pos: player(x.pid)?.pos || x.pos,
+    fromName: tn(x.from) || x.fromName,
+    toName: tn(x.to) || x.toName,
+    toLogo: teamLogo(x.to)
+  }));
+
+  const outgoing = (db.transfers || []).filter((x: any) => x.to === req.tid && x.status === 'pending').map((x: any) => ({
+    ...x,
+    pName: player(x.pid)?.name || x.playerName,
+    pos: player(x.pid)?.pos || x.pos,
+    fromName: tn(x.from) || x.fromName,
+    fromLogo: teamLogo(x.from),
+    toName: tn(x.to) || x.toName
+  }));
+
   res.json({
     team: { ...pubTeam(t), code: req.me.role === 'admin' ? t.code : undefined },
     squadMax: db.settings.squadMax,
@@ -2761,7 +4817,14 @@ app.get('/api/club', needClub, (req: any, res) => {
       opp: tn(f.home === req.tid ? f.away : f.home),
       oppLogo: teamLogo(f.home === req.tid ? f.away : f.home)
     })),
-    transfers: db.transfers.filter((x: any) => x.to === req.tid).slice(-10)
+    transfers: db.transfers.filter((x: any) => x.to === req.tid).slice(-10),
+    incomingTransfers: incoming,
+    outgoingTransfers: outgoing,
+    foreignOffers: (db.foreignOffers || []).filter((o: any) => o.clubId === req.tid && o.status === 'pending'),
+    foreignHistory: (db.foreignOffers || []).filter((o: any) => o.clubId === req.tid && o.status !== 'pending').slice(-10).reverse(),
+    budget: t.budget || 0,
+    formattedBudget: '€' + (t.budget || 0).toLocaleString('ru-RU'),
+    budgetHistory: (Array.isArray(db.budgetHistory) ? db.budgetHistory : []).filter((h: any) => h.teamId === req.tid).slice(-20).reverse()
   });
 });
 
@@ -2791,9 +4854,47 @@ app.post('/api/club/squad/add', needClub, async (req: any, res) => {
 
     const owner = p.teamId && p.teamId !== req.tid && team(p.teamId) && (team(p.teamId).code || squadOf(p.teamId).length);
     if (owner && req.me.role !== 'admin') {
-      db.transfers.push({ id: uid(), pid: p.id, from: p.teamId, to: req.tid, status: 'pending', note: String(req.body.note || '').slice(0, 300), at: Date.now() });
+      const fromTeam = team(p.teamId);
+      const toTeam = team(req.tid);
+      const isRplToRpl = fromTeam?.comp === 'rpl' && toTeam?.comp === 'rpl';
+      const feeStr = String(req.body.fee || '€5.0M').trim();
+      const feeNum = parseFeeAmount(feeStr);
+      const isLoan = String(req.body.transferType || req.body.type || '').includes('loan');
+      const note = String(req.body.note || (isLoan ? 'Аренда' : 'Полноценный трансфер')).slice(0, 300);
+
+      const trObj = {
+        id: uid(),
+        pid: p.id,
+        playerName: p.name,
+        pos: p.pos || 'ЦП',
+        from: p.teamId,
+        fromName: fromTeam?.name || 'Клуб',
+        to: req.tid,
+        toName: toTeam?.name || 'Клуб',
+        fee: feeStr,
+        feeAmount: feeNum,
+        type: isLoan ? 'loan' : 'transfer',
+        note,
+        status: 'pending',
+        isRplToRpl,
+        clubApproval: 'pending',
+        adminApproval: 'pending',
+        clubApprovedBy: p.teamId,
+        initiator: req.tid,
+        date: new Date().toISOString().slice(0, 10),
+        at: Date.now()
+      };
+
+      db.transfers.unshift(trObj);
       save();
-      return res.json({ pending: 1, message: `${p.name} числится в «${tn(p.teamId)}». Заявка на трансфер отправлена админу.` });
+      return res.json({
+        pending: 1,
+        isRplToRpl,
+        transfer: trObj,
+        message: isRplToRpl
+          ? `${p.name} числится в «${tn(p.teamId)}». Запрос (${feeStr}) отправлен владельцу «${tn(p.teamId)}» и администратору лиги. Переход состоится при обоюдном согласии.`
+          : `${p.name} числится в «${tn(p.teamId)}». Заявка на трансфер отправлена администратору.`
+      });
     }
     p.teamId = req.tid;
     db.squads[req.tid] = [...cur.map((x: any) => x.id), p.id];
@@ -2802,6 +4903,103 @@ app.post('/api/club/squad/add', needClub, async (req: any, res) => {
   } catch (e: any) {
     fail(res, e.message);
   }
+});
+
+app.post('/api/club/transfer/respond', needClub, (req: any, res) => {
+  const { transferId, action, comment } = req.body;
+  const t = db.transfers.find((x: any) => x.id === transferId);
+  if (!t || t.status !== 'pending') return fail(res, 'Заявка на трансфер не найдена или уже завершена');
+  if (t.from !== req.tid && t.to !== req.tid) {
+    return fail(res, 'Этот трансфер не относится к вашему клубу');
+  }
+
+  if (action === 'approve') {
+    t.clubApproval = 'approved';
+    t.clubRespondedAt = new Date().toISOString();
+    if (comment) t.clubComment = String(comment).slice(0, 200);
+    const executed = executeTransferIfBothApproved(t);
+    save();
+    return res.json({
+      ok: 1,
+      approved: true,
+      executed,
+      message: executed
+        ? 'Сделка окончательно согласована и завершена! Футболист переведен в состав.'
+        : 'Вы дали согласие на сделку. Ожидается финальное подтверждение от администратора лиги.'
+    });
+  } else {
+    t.clubApproval = 'rejected';
+    t.status = 'rejected';
+    t.rejectReason = `Отклонено владельцем клуба «${tn(req.tid)}»`;
+    save();
+    return res.json({ ok: 1, rejected: true, message: `Вы отклонили сделку по игроку ${t.playerName}.` });
+  }
+});
+
+app.post('/api/club/foreign-offer/respond', needClub, (req: any, res) => {
+  const { offerId, action, comment } = req.body;
+  try {
+    const result = respondToForeignOffer(db, offerId, action, req.tid, comment);
+    save();
+    res.json({ ok: 1, ...result });
+  } catch (err: any) {
+    fail(res, err.message || 'Ошибка обработки зарубежного предложения');
+  }
+});
+
+app.post('/api/club/scout-request', admin, needClub, async (req: any, res) => {
+  const t = team(req.tid);
+  if (!t) return fail(res, 'Клуб не найден');
+  const sq = squadOf(req.tid);
+  if (!sq.length) return fail(res, 'В составе клуба нет игроков для скаутинга');
+
+  const sorted = [...sq].sort((a: any, b: any) => (b.rating || 70) - (a.rating || 70));
+  const candidate = sorted[0];
+
+  try {
+    const offer = await createForeignOfferWithAI({
+      player: candidate,
+      club: t,
+      performanceReason: req.body.reason || `Высокий класс игры и стабильное лидерство в составе «${t.name}» (рейтинг ${candidate.rating || 75})`
+    });
+    if (!db.foreignOffers) db.foreignOffers = [];
+    db.foreignOffers.push(offer);
+
+    if (!db.transfers) db.transfers = [];
+    db.transfers.push({
+      id: 'tr_' + offer.id,
+      pid: offer.pid,
+      playerName: offer.playerName,
+      pos: offer.pos,
+      from: t.id,
+      fromName: t.name,
+      to: null,
+      toName: offer.buyerClub,
+      isForeign: true,
+      buyerCountry: offer.buyerCountry,
+      buyerFlag: offer.buyerFlag,
+      type: offer.type,
+      fee: offer.fee,
+      feeAmount: offer.feeAmount,
+      date: offer.date.slice(0, 10),
+      status: 'pending',
+      clubApproval: 'pending',
+      adminApproval: 'approved',
+      note: offer.scoutReport,
+      foreignOfferId: offer.id
+    });
+    save();
+
+    tg(`🌍 <b>Новый зарубежный запрос!</b>\nКлуб «${esc(offer.buyerClub)}» (${esc(offer.buyerCountry)}) сделал официальное предложение по игроку <b>${esc(offer.playerName)}</b> («${esc(offer.clubName)}») на сумму <b>${esc(offer.fee)}</b>!`);
+
+    res.json({ ok: 1, offer, message: `Поступило предложение от «${offer.buyerClub}» (${offer.buyerCountry}) на сумму ${offer.fee}!` });
+  } catch (err: any) {
+    fail(res, err.message || 'Не удалось получить предложение скаутов');
+  }
+});
+
+app.get('/api/foreign-offers', (req, res) => {
+  res.json(db.foreignOffers || []);
 });
 
 app.post('/api/club/squad/remove', needClub, (req: any, res) => {
@@ -2858,6 +5056,7 @@ app.post('/api/club/lineup', needClub, (req: any, res) => {
 
 /* — админ — */
 app.get('/api/admin/overview', admin, (req, res) => {
+  ensureTeamCodes();
   res.json({
     teams: db.teams.map((t: any) => ({
       ...pubTeam(t),
@@ -2868,22 +5067,37 @@ app.get('/api/admin/overview', admin, (req, res) => {
     settings: {
       ...db.settings,
       keys: undefined,
-      tgToken: db.settings.tgToken ? '••••' : '',
+      tgToken: tgToken() ? '••••' : '',
       adminCode: db.settings.adminCode,
       systemPrompt: db.settings.systemPrompt || SYS_DEFAULT
     },
     keys: {
-      gemini: !!(process.env.GEMINI_API_KEY || db.settings.keys.gemini),
-      groq: !!(process.env.GROQ_API_KEY || db.settings.keys.groq),
-      openrouter: !!(process.env.OPENROUTER_API_KEY || db.settings.keys.openrouter)
+      gemini: !!(getGeminiKeys().length),
+      geminiCount: getGeminiKeys().length,
+      geminiTails: getGeminiKeys().map((k: string) => '…' + k.slice(-4)),
+      geminiCooling: getGeminiKeys().filter((k: string) => (keyCooldown.get(k) || 0) > Date.now()).length,
+      groq: !!(process.env.GROQ_API_KEY || db.settings.keys.groq || HARDCODED.groqKey),
+      openrouter: !!(process.env.OPENROUTER_API_KEY || db.settings.keys.openrouter || HARDCODED.openrouterKey)
     },
     models: db.settings.models,
     log: db.llmlog.slice(-25).reverse(),
-    transfers: db.transfers.filter((t: any) => t.status === 'pending').map((t: any) => ({
+    transfers: (db.transfers || []).filter((t: any) => t.status === 'pending').map((t: any) => ({
       ...t,
-      pName: player(t.pid)?.name,
-      fromName: tn(t.from),
-      toName: tn(t.to)
+      pName: player(t.pid)?.name || t.playerName,
+      pos: player(t.pid)?.pos || t.pos || 'ЦП',
+      fromName: tn(t.from) || t.fromName || 'Клуб',
+      toName: tn(t.to) || t.toName || 'Клуб',
+      fromLogo: teamLogo(t.from),
+      toLogo: teamLogo(t.to)
+    })),
+    allTransfers: (db.transfers || []).slice(0, 30).map((t: any) => ({
+      ...t,
+      pName: player(t.pid)?.name || t.playerName,
+      pos: player(t.pid)?.pos || t.pos || 'ЦП',
+      fromName: tn(t.from) || t.fromName || 'Клуб',
+      toName: tn(t.to) || t.toName || 'Клуб',
+      fromLogo: teamLogo(t.from),
+      toLogo: teamLogo(t.to)
     }))
   });
 });
@@ -2917,13 +5131,25 @@ app.post('/api/admin/season', admin, (req, res) => {
     return fail(res, 'Для этого сезона расписание уже есть. Измените название сезона или подтвердите пересоздание.');
   }
   if (db.settings.season === name) db.fixtures = db.fixtures.filter((f: any) => f.season !== name);
+  db.settings.manualDraw = false;
   genSeason(start, name);
+  save();
   res.json({ ok: 1, fixtures: seasonFx().length });
+});
+
+app.post('/api/admin/clear-fixtures', admin, (req, res) => {
+  db.fixtures = [];
+  db.cupState2026 = null;
+  db.settings.manualDraw = true;
+  invalidateAgg();
+  save();
+  res.json({ ok: 1, message: 'Все турнирные матчи очищены. База готова к новой жеребьёвке.' });
 });
 
 app.post('/api/admin/team', admin, (req, res) => {
   const b = req.body;
   let t = b.id && team(b.id);
+  if (b.regen || b.clearCode) return fail(res, 'Коды клубов закреплены и не меняются', 403);
   if (b.delete) {
     if (!t) return fail(res, 'Нет такой команды');
     if (db.fixtures.some((f: any) => f.home === t.id || f.away === t.id)) return fail(res, 'У команды есть матчи — удалять нельзя');
@@ -2948,8 +5174,7 @@ app.post('/api/admin/team', admin, (req, res) => {
     lat: b.lat === '' || b.lat == null ? t.lat ?? null : +b.lat,
     lon: b.lon === '' || b.lon == null ? t.lon ?? null : +b.lon
   });
-  if (b.regen || (b.comp === 'rpl' && !t.code)) t.code = mkCode();
-  if (b.clearCode) t.code = '';
+  ensureTeamCodes();
   save();
   res.json({ ok: 1, team: pubTeam(t) });
 });
@@ -2979,6 +5204,100 @@ app.get('/api/admin/players', admin, (req, res) => {
   if (req.query.teamId) l = l.filter((p: any) => p.teamId === req.query.teamId);
   if (q) l = l.filter((p: any) => norm(p.name).includes(q));
   res.json(l.slice(0, 300).map(pubPlayer));
+});
+
+app.post('/api/admin/players/clear-all', admin, (req, res) => {
+  const count = (db.players || []).length;
+  db.players = [];
+  db.squads = {};
+  db.lineups = {};
+  db.foreignOffers = [];
+  save();
+  res.json({ ok: 1, cleared: count, message: `Все игроки (${count}) успешно удалены из базы данных.` });
+});
+
+app.post('/api/admin/players/generate-all', admin, (req, res) => {
+  let count = 0;
+  const existingPlayerIds = new Set((db.players || []).map((p: any) => p.id));
+  for (const t of (db.teams || [])) {
+    const fullSquad = generateFullSquad(t);
+    const newIds: string[] = [];
+    for (const p of fullSquad) {
+      db.players.push(p);
+      existingPlayerIds.add(p.id);
+      newIds.push(p.id);
+      count++;
+    }
+    db.squads[t.id] = newIds;
+  }
+  save();
+  res.json({ ok: 1, generated: count, message: `Сгенерированы полные составы для всех команд (${count} игроков).` });
+});
+
+app.post('/api/admin/players/generate-club/:teamId', admin, (req, res) => {
+  const t = team(req.params.teamId);
+  if (!t) return fail(res, 'Клуб не найден');
+  const fullSquad = generateFullSquad(t);
+  const ids: string[] = [];
+  for (const p of fullSquad) {
+    db.players.push(p);
+    ids.push(p.id);
+  }
+  db.squads[t.id] = ids;
+  save();
+  res.json({ ok: 1, count: ids.length, message: `Состав клуба «${t.name}» сгенерирован (${ids.length} игроков).` });
+});
+
+app.post('/api/admin/foreign-offers/generate', admin, async (req: any, res) => {
+  const { playerId, teamId } = req.body;
+  let p = playerId ? player(playerId) : null;
+  if (!p && teamId) {
+    const sq = squadOf(teamId);
+    p = sq[0];
+  }
+  if (!p) p = (db.players || [])[0];
+  if (!p) return fail(res, 'Игрок не найден');
+  const clb = team(p.teamId);
+  if (!clb) return fail(res, 'Клуб игрока не найден');
+
+  try {
+    const offer = await createForeignOfferWithAI({
+      player: p,
+      club: clb,
+      performanceReason: req.body.reason || `Отличная форма и уверенная игра в чемпионате (рейтинг ${p.rating || 75})`
+    });
+    if (!db.foreignOffers) db.foreignOffers = [];
+    db.foreignOffers.push(offer);
+
+    if (!db.transfers) db.transfers = [];
+    db.transfers.push({
+      id: 'tr_' + offer.id,
+      pid: offer.pid,
+      playerName: offer.playerName,
+      pos: offer.pos,
+      from: clb.id,
+      fromName: clb.name,
+      to: null,
+      toName: offer.buyerClub,
+      isForeign: true,
+      buyerCountry: offer.buyerCountry,
+      buyerFlag: offer.buyerFlag,
+      type: offer.type,
+      fee: offer.fee,
+      feeAmount: offer.feeAmount,
+      date: offer.date.slice(0, 10),
+      status: 'pending',
+      clubApproval: 'pending',
+      adminApproval: 'approved',
+      note: offer.scoutReport,
+      foreignOfferId: offer.id
+    });
+    save();
+
+    res.json({ ok: 1, offer, message: `Оффер от «${offer.buyerClub}» сформирован.` });
+  } catch (err: any) {
+    fail(res, err.message || 'Ошибка генерации оффера');
+  }
 });
 
 app.post('/api/admin/player', admin, (req, res) => {
@@ -3063,22 +5382,57 @@ app.post('/api/admin/fixture', admin, (req, res) => {
     mcache.delete(f.id);
     invalidateAgg();
     save();
-    return res.json({ ok: 1 });
+    return res.json({ ok: 1, fixture: pubFx(f) });
   }
-  if (f.status !== 'scheduled' && !req.body.force) return fail(res, 'Матч уже сыгран');
-  if (/^\d{4}-\d{2}-\d{2}$/.test(req.body.date || '')) f.date = req.body.date;
-  if (/^\d{2}:\d{2}$/.test(req.body.time || '')) f.time = req.body.time;
-  if (req.body.hg !== undefined && req.body.ag !== undefined && f.status === 'scheduled') {
+
+  // If score is manually set, check if match is not already played unless force is specified
+  if (req.body.hg !== undefined && req.body.ag !== undefined) {
+    if (f.status !== 'scheduled' && !req.body.force) return fail(res, 'Матч уже сыгран');
     f.hg = +req.body.hg;
     f.ag = +req.body.ag;
     f.status = 'done';
     f.st = null;
-    if (f.comp === 'cup' && f.hg === f.ag) f.pen = shootout(f);
+    if ((f.comp === 'cup' || f.comp === 'supercup') && f.hg === f.ag) f.pen = shootout(f);
+    checkPlayoffShootout(f);
     invalidateAgg();
     advanceCup();
   }
+
+  // Game date and time (allow single match manual adjustment)
+  const gDate = String(req.body.gameDate || req.body.date || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(gDate)) {
+    f.gameDate = gDate;
+    f.date = gDate;
+  }
+  let gTime = String(req.body.gameTime || req.body.time || '').trim();
+  if (/^\d{1,2}:\d{2}$/.test(gTime)) {
+    if (gTime.length === 4) gTime = '0' + gTime;
+    f.gameTime = gTime;
+    f.time = gTime;
+  }
+
+  // Real date and time (allow single match manual adjustment by admin)
+  const rDate = String(req.body.realDate || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(rDate)) {
+    f.realDate = rDate;
+  }
+  let rTime = String(req.body.realTime || '').trim();
+  if (/^\d{1,2}:\d{2}$/.test(rTime)) {
+    if (rTime.length === 4) rTime = '0' + rTime;
+    f.realTime = rTime;
+  }
+
+  // Stadium and neutral field
+  if (req.body.stadium !== undefined && typeof req.body.stadium === 'string') {
+    f.stadium = req.body.stadium.trim();
+  }
+  if (req.body.neutralField !== undefined) {
+    f.neutralField = !!req.body.neutralField;
+  }
+
+  invalidateAgg();
   save();
-  res.json({ ok: 1 });
+  res.json({ ok: 1, fixture: pubFx(f) });
 });
 
 app.get('/api/admin/lineups/:fid', admin, (req, res) => {
@@ -3115,17 +5469,67 @@ app.post('/api/admin/transfer', admin, (req, res) => {
   const t = db.transfers.find((x: any) => x.id === req.body.id);
   if (!t || t.status !== 'pending') return fail(res, 'Заявка не найдена');
   if (req.body.approve) {
-    const p = player(t.pid);
-    if (!p) return fail(res, 'Игрока нет');
-    if (t.from && db.squads[t.from]) db.squads[t.from] = db.squads[t.from].filter((i: string) => i !== p.id);
-    db.squads[t.to] = [...new Set([...squadOf(t.to).map((x: any) => x.id), p.id])];
-    p.teamId = t.to;
-    t.status = 'approved';
+    t.adminApproval = 'approved';
+    if (req.body.force || !t.isRplToRpl) {
+      t.clubApproval = 'approved';
+    }
+    const executed = executeTransferIfBothApproved(t);
+    save();
+    res.json({ ok: 1, approved: true, executed, isRplToRpl: t.isRplToRpl, clubApproval: t.clubApproval });
   } else {
+    t.adminApproval = 'rejected';
     t.status = 'rejected';
+    t.rejectReason = 'Отклонено администратором';
+    save();
+    res.json({ ok: 1, rejected: true });
   }
-  save();
-  res.json({ ok: 1 });
+});
+
+app.post('/api/admin/transfer/respond', admin, (req, res) => {
+  const { transferId, action, force } = req.body;
+  const t = db.transfers.find((x: any) => x.id === transferId);
+  if (!t || t.status !== 'pending') return fail(res, 'Заявка не найдена или уже закрыта');
+  if (action === 'approve') {
+    t.adminApproval = 'approved';
+    if (force || !t.isRplToRpl) {
+      t.clubApproval = 'approved';
+    }
+    const executed = executeTransferIfBothApproved(t);
+    save();
+    res.json({
+      ok: 1,
+      approved: true,
+      executed,
+      transfer: t,
+      message: executed
+        ? 'Сделка окончательно одобрена и завершена!'
+        : 'Администратор одобрил сделку. Ожидается подтверждение от владельца клуба.'
+    });
+  } else {
+    t.adminApproval = 'rejected';
+    t.status = 'rejected';
+    t.rejectReason = 'Отклонено администратором';
+    save();
+    res.json({ ok: 1, rejected: true, message: 'Сделка отклонена администратором' });
+  }
+});
+
+app.post('/api/admin/transfer/ai-advice', admin, async (req, res) => {
+  const { transferId } = req.body;
+  const t = db.transfers.find((x: any) => x.id === transferId);
+  if (!t) return fail(res, 'Трансфер не найден');
+  const p = player(t.pid);
+  const fromT = team(t.from);
+  const toT = team(t.to);
+
+  try {
+    const advice = await getTransferAiAdvice(t, p, fromT, toT);
+    t.aiAdvice = advice;
+    save();
+    res.json({ ok: 1, advice, transferId: t.id });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || 'Ошибка генерации совета' });
+  }
 });
 
 app.post('/api/admin/ask', admin, async (req, res) => {
@@ -3142,6 +5546,178 @@ app.post('/api/admin/ask', admin, async (req, res) => {
   } catch (e: any) {
     fail(res, e.message);
   }
+});
+
+/* ───────── бюджеты команд и начисление призовых (только админ) ───────── */
+app.get('/api/admin/budgets', admin, (req, res) => {
+  try {
+    ensureInitialBudgets();
+    const teams = db.teams.map((t: any) => ({
+      id: t.id,
+      name: t.name,
+      comp: t.comp,
+      city: t.city,
+      stadium: t.stadium,
+      logo: teamLogo(t.id),
+      budget: t.budget || 0,
+      formattedBudget: '€' + (t.budget || 0).toLocaleString('ru-RU')
+    })).sort((a: any, b: any) => {
+      if (a.comp === 'rpl' && b.comp !== 'rpl') return -1;
+      if (a.comp !== 'rpl' && b.comp === 'rpl') return 1;
+      return (b.budget || 0) - (a.budget || 0);
+    });
+
+    const rplStandings = table('rpl').map((row: any, idx: number) => ({
+      place: idx + 1,
+      teamId: row.id,
+      teamName: row.name,
+      logo: teamLogo(row.id),
+      points: row.pts || 0,
+      played: row.p || 0,
+      defaultPrize: RPL_PRIZE_SCALE[idx]?.prize || 3_400_000,
+      label: RPL_PRIZE_SCALE[idx]?.label || `${idx + 1} место`
+    }));
+
+    const cupSuggestions = calculateCupPrizeSuggestions();
+
+    res.json({
+      teams,
+      history: (Array.isArray(db.budgetHistory) ? db.budgetHistory : []).slice(-200).reverse(),
+      rplScale: RPL_PRIZE_SCALE,
+      cupScale: CUP_PRIZE_SCALE,
+      rplStandings,
+      cupSuggestions,
+      totalLeagueBudget: teams.reduce((acc: number, t: any) => acc + (t.budget || 0), 0)
+    });
+  } catch (e: any) {
+    fail(res, e.message);
+  }
+});
+
+app.post('/api/admin/budget/adjust', admin, (req, res) => {
+  ensureInitialBudgets();
+  const { teamId, amount, mode, reason } = req.body;
+  const t = team(teamId);
+  if (!t) return fail(res, 'Клуб не найден');
+  const numAmt = Number(amount);
+  if (isNaN(numAmt)) return fail(res, 'Некорректная сумма');
+
+  const prevBudget = t.budget || 0;
+  let newBudget = prevBudget;
+  let diff = 0;
+
+  if (mode === 'set') {
+    newBudget = Math.max(0, Math.round(numAmt));
+    diff = newBudget - prevBudget;
+  } else if (mode === 'subtract') {
+    diff = -Math.abs(Math.round(numAmt));
+    newBudget = Math.max(0, prevBudget + diff);
+  } else {
+    diff = Math.abs(Math.round(numAmt));
+    newBudget = prevBudget + diff;
+  }
+
+  t.budget = newBudget;
+
+  const entry = {
+    id: uid(),
+    teamId: t.id,
+    teamName: t.name,
+    amount: diff,
+    prevBudget,
+    newBudget,
+    type: 'admin_adjustment',
+    typeLabel: 'Ручная корректировка админа',
+    description: reason || (diff >= 0 ? `Пополнение бюджета: +€${Math.abs(diff).toLocaleString('ru-RU')}` : `Списание из бюджета: -€${Math.abs(diff).toLocaleString('ru-RU')}`),
+    date: new Date().toISOString(),
+    byAdmin: true
+  };
+
+  if (!Array.isArray(db.budgetHistory)) db.budgetHistory = [];
+  db.budgetHistory.push(entry);
+  save();
+
+  res.json({ ok: 1, newBudget, entry, formattedBudget: '€' + newBudget.toLocaleString('ru-RU') });
+});
+
+app.post('/api/admin/budget/award-prizes', admin, (req, res) => {
+  ensureInitialBudgets();
+  const { rplAwards, cupAwards, seasonName } = req.body;
+  const curSeason = seasonName || db.settings.season || '2026/27';
+
+  let count = 0;
+  let totalAwarded = 0;
+  const now = new Date().toISOString();
+
+  if (Array.isArray(rplAwards)) {
+    for (const aw of rplAwards) {
+      if (!aw.teamId) continue;
+      const t = team(aw.teamId);
+      const prize = Number(aw.prize);
+      if (!t || isNaN(prize) || prize <= 0) continue;
+
+      const prevBudget = t.budget || 0;
+      t.budget = prevBudget + prize;
+      const placeText = aw.place ? `${aw.place} место в РПЛ` : 'Призовые РПЛ';
+
+      if (!Array.isArray(db.budgetHistory)) db.budgetHistory = [];
+      db.budgetHistory.push({
+        id: uid(),
+        teamId: t.id,
+        teamName: t.name,
+        amount: prize,
+        prevBudget,
+        newBudget: t.budget,
+        type: 'rpl_prize',
+        typeLabel: 'Призовые РПЛ',
+        description: `Начислены призовые за ${placeText} (Сезон ${curSeason}): +€${prize.toLocaleString('ru-RU')}`,
+        date: now,
+        byAdmin: true
+      });
+      count++;
+      totalAwarded += prize;
+    }
+  }
+
+  if (Array.isArray(cupAwards)) {
+    for (const aw of cupAwards) {
+      if (!aw.teamId) continue;
+      const t = team(aw.teamId);
+      const prize = Number(aw.prize);
+      if (!t || isNaN(prize) || prize <= 0) continue;
+
+      const prevBudget = t.budget || 0;
+      t.budget = prevBudget + prize;
+      const stageText = aw.stageLabel || 'Участие в Кубке России';
+      const winsNote = aw.wins ? ` (${aw.wins} побед)` : '';
+
+      if (!Array.isArray(db.budgetHistory)) db.budgetHistory = [];
+      db.budgetHistory.push({
+        id: uid(),
+        teamId: t.id,
+        teamName: t.name,
+        amount: prize,
+        prevBudget,
+        newBudget: t.budget,
+        type: 'cup_prize',
+        typeLabel: 'Призовые Кубка России',
+        description: `Призовые Кубка России: ${stageText}${winsNote} (Сезон ${curSeason}): +€${prize.toLocaleString('ru-RU')}`,
+        date: now,
+        byAdmin: true
+      });
+      count++;
+      totalAwarded += prize;
+    }
+  }
+
+  save();
+  res.json({
+    ok: 1,
+    awardedCount: count,
+    totalAwarded,
+    formattedTotal: '€' + totalAwarded.toLocaleString('ru-RU'),
+    message: `Успешно начислены призовые для ${count} клубов на сумму €${totalAwarded.toLocaleString('ru-RU')}!`
+  });
 });
 
 /* ───────── старт и инициализация ───────── */
@@ -3649,46 +6225,72 @@ app.delete('/api/admin/tournament/:id', admin, (req, res) => {
   res.json({ ok: 1 });
 });
 
-/* ───────── прямой трансфер админа (с сохранением всей статистики) ───────── */
+/* ───────── прямой трансфер админа (с указанием суммы, сохранением статистики и согласованием РПЛ) ───────── */
 app.post('/api/admin/transfer/direct', admin, (req, res) => {
-  const { pid, toTeamId, transferType } = req.body;
+  const { pid, toTeamId, transferType, fee, force } = req.body;
   const p = player(pid);
   const toTeam = team(toTeamId);
   if (!p || !toTeam) return fail(res, 'Игрок или клуб не найден');
   const fromTeamId = p.teamId;
-  if (fromTeamId && db.squads[fromTeamId]) {
-    db.squads[fromTeamId] = db.squads[fromTeamId].filter((id: string) => id !== p.id);
-  }
-  db.squads[toTeamId] = [...new Set([...squadOf(toTeamId).map((x: any) => x.id), p.id])];
-  p.teamId = toTeamId;
+  const fromTeam = team(fromTeamId);
+
+  const feeStr = String(fee || '€5.0M').trim();
+  const feeNum = parseFeeAmount(feeStr);
   const loanMap: Record<string, string> = {
     'loan_0.5': 'Аренда (0.5 года)',
     'loan_1': 'Аренда (1 год)',
     'loan_1.5': 'Аренда (1.5 года)',
     'loan_2': 'Аренда (2 года)'
   };
-  const note = loanMap[transferType] || 'Прямой трансфер';
-  if (loanMap[transferType]) {
-    p.loanFrom = fromTeamId;
-    p.loanTerm = loanMap[transferType];
-  } else {
-    delete p.loanFrom;
-    delete p.loanTerm;
-  }
-  // Вся статистика игрока (goals, assists, matches, yellowCards, redCards, saves, tackles, shots, xg, cleanSheets, rating, seasonYC, banLeft) сохраняется!
-  db.transfers.unshift({
+  const isLoan = !!loanMap[transferType];
+  const note = loanMap[transferType] || 'Полноценный трансфер';
+
+  const isRplToRpl = fromTeam?.comp === 'rpl' && toTeam?.comp === 'rpl';
+
+  const trObj: any = {
     id: uid(),
     pid: p.id,
     playerName: p.name,
-    from: fromTeamId,
+    pos: p.pos || 'ЦП',
+    from: fromTeamId || 'free_agent',
+    fromName: fromTeam?.name || 'Свободный агент',
     to: toTeamId,
+    toName: toTeam.name,
+    fee: feeStr,
+    feeAmount: feeNum,
+    type: isLoan ? 'loan' : 'transfer',
     note,
-    status: 'approved',
+    status: 'pending',
+    isRplToRpl,
+    adminApproval: 'approved',
+    clubApproval: (isRplToRpl && !force) ? 'pending' : 'approved',
+    clubApprovedBy: fromTeamId,
     date: new Date().toISOString().slice(0, 10),
     byAdmin: true
-  });
+  };
+
+  db.transfers.unshift(trObj);
+
+  if (!isRplToRpl || force) {
+    executeTransferIfBothApproved(trObj);
+    save();
+    return res.json({
+      ok: 1,
+      executed: true,
+      player: p,
+      transfer: trObj,
+      message: `Трансфер игрока ${p.name} в «${toTeam.name}» (${feeStr}) успешно оформлен.`
+    });
+  }
+
   save();
-  res.json({ ok: 1, player: p });
+  res.json({
+    ok: 1,
+    executed: false,
+    pendingClub: true,
+    transfer: trObj,
+    message: `Запрос на ${isLoan ? 'аренду' : 'трансфер'} игрока ${p.name} (${feeStr}) отправлен владельцу «${fromTeam?.name}». Переход состоится при согласии клуба.`
+  });
 });
 
 /* ───────── Сборная России (паузы, расширенный/итоговый состав, товарищеские матчи, архив) ───────── */
@@ -3724,8 +6326,15 @@ function enrichNationalBreak(brk: any) {
       rating: p.rating || 0
     };
   }).filter(Boolean);
+  const matches = (brk.matches || []).map((m: any) => ({
+    ...m,
+    russiaLogo: '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+    opponentLogo: teamLogo(m.opponent)
+  }));
   return {
     ...brk,
+    teamLogo: '/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg',
+    matches,
     extendedPlayers: enrichIds(brk.extended),
     finalPlayers: enrichIds(brk.final)
   };
@@ -4122,15 +6731,38 @@ function syncRplFridaySchedules() {
 }
 
 syncRplFridaySchedules();
+ensureDualTimes();
 invalidateAgg();
 resumeLive();
 
 setInterval(() => {
   if (!db.settings.auto) return;
   const now = new Date();
-  const due = seasonFx().filter((f: any) => f.status === 'scheduled' && at(f) <= now);
-  if (due.length) runBatch(due).catch(console.error);
-}, 60000);
+  const allSeason = seasonFx();
+
+  // Strict rule for RPL and Russian Cup:
+  // "А также если я хочу чтобы матчи сами автоматически игрались по достижению времени реального - 
+  // это касается не только, но и кубка России. Это действует только на кубок России и рпл, 
+  // получается если идет рпл, то в этот день только рпл, если наступило время кубка России, 
+  // то идет кубок России, мы двигаемся строго по расписанию виртуального времени."
+  const rplAndCupDue = allSeason.filter((f: any) => {
+    if (f.status !== 'scheduled') return false;
+    if (f.comp !== 'rpl' && f.comp !== 'cup' && f.comp !== 'supercup') return false;
+    return realAt(f) <= now;
+  });
+
+  const othersDue = allSeason.filter((f: any) => {
+    if (f.status !== 'scheduled') return false;
+    if (f.comp === 'rpl' || f.comp === 'cup' || f.comp === 'supercup') return false;
+    const matchTime = f.realDate && f.realTime ? realAt(f) : at(f);
+    return matchTime <= now;
+  });
+
+  const due = [...rplAndCupDue, ...othersDue];
+  if (due.length) {
+    runBatch(due).catch(console.error);
+  }
+}, 30000);
 
 process.on('SIGINT', () => { saveNow(); process.exit(0); });
 process.on('SIGTERM', () => { saveNow(); process.exit(0); });
@@ -4164,6 +6796,8 @@ async function startServer() {
 }
 
 // Запускаем сервер если запускается напрямую
-startServer();
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}
 
 export { db };

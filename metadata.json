@@ -2,5 +2,7 @@
   "name": "Вирт РПЛ — Онлайн-симулятор футбола",
   "description": "Вирт РПЛ — интерактивный симулятор чемпионата России по футболу с трансляциями матчей, составами, тактикой и логотипами команд.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
